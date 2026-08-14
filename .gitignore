@@ -1,0 +1,83 @@
+# Build artifacts
+/build/
+/build/**
+/devel/
+/install/
+/.catkin_workspace
+/.catkin_tools/
+**/build/
+**/devel/
+**/install/
+**/.catkin_tools/
+
+# CMake / catkin generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+CTestConfiguration.ini
+catkin_generated/
+catkin/config.cmake
+catkin_generated_install.cmake
+*.cmake
+
+gtest/
+
+# Binary / library artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.out
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs and runtime output
+*.log
+*.txt
+!Log/guide.md
+!Log/plot.py
+Log/*.txt
+Log/*.log
+log/
+
+# ROS / runtime generated data
+*.bag
+*.pcd
+*.ply
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.avi
+*.mp4
+
+# Local environment overlays (keep source repos, ignore generated workspace output)
+environment/rslidar_ws/build/
+environment/rslidar_ws/devel/
+environment/rslidar_ws/install/
+environment/rslidar_ws/.catkin_tools/
+environment/rslidar_ws/.catkin_workspace
+
+environment/ws_livox/build/
+environment/ws_livox/devel/
+environment/ws_livox/install/
+environment/ws_livox/.catkin_tools/
+environment/ws_livox/.catkin_workspace
+
+# Generated shell outputs from the install script
+*.orig
+*.rej

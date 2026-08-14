@@ -1,0 +1,36 @@
+common:
+    lid_topic:  "/rslidar_points"
+    imu_topic:  "/rslidar_imu_data"
+    time_sync_en: false
+    time_offset_lidar_to_imu: 0.0
+
+preprocess:
+    lidar_type: 5                # 5: RoboSense XYZIRT (Airy)
+    scan_line: 96                # Airy model is auto-detected by rslidar_sdk; raw mode does not use this value
+    timestamp_unit: 0            # Airy handler reads absolute timestamp in seconds and normalizes it internally
+    blind: 0.5
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree: 360
+    det_range: 60.0
+    # The nominal Airy LiDAR-to-IMU rotation is used only as an initial value.
+    # Replace these values with the calibration stored in your unit's DIFOP data.
+    extrinsic_est_en: true
+    extrinsic_T: [0.00425, 0.00418, -0.00446]
+    extrinsic_R: [ 0.0, -1.0,  0.0,
+                  -1.0,  0.0,  0.0,
+                   0.0,  0.0, -1.0]
+
+publish:
+    path_en: false
+    scan_publish_en: true
+    dense_publish_en: true
+    scan_bodyframe_pub_en: true
+
+pcd_save:
+    pcd_save_en: false
+    interval: -1
