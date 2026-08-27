@@ -15,7 +15,10 @@ lidar:
       tail_layer_bytes: 0
       min_distance: 0.2
       max_distance: 60.0
-      use_lidar_clock: true
+      # This Airy currently reports a device-uptime clock rather than Unix/UTC.
+      # Use host receive time so ROS, MAVROS and PX4 share one epoch.  Set true
+      # only after the lidar itself has been verified PTP/GPS-synchronised.
+      use_lidar_clock: false
       dense_points: true
       ts_first_point: true
       wait_for_difop: true

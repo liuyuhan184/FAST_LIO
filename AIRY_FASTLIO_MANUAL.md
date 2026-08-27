@@ -4,14 +4,15 @@
 
 - Ubuntu 20.04 + ROS Noetic；
 - x86/AMD64 调试电脑；
-- ARM64/RK3588 无人机开发板；
+- NVIDIA Jetson Orin NX / Orin Nano，以及其他 ARM64 开发板；
 - RoboSense Airy、`rslidar_sdk` v1.5.19 和本项目的 FAST-LIO2 Airy 适配。
 
 建议严格按“接线与网络 → 编译 → 驱动自检 → FAST-LIO”的顺序操作。
 网络层没有数据时，不要先调 ROS 或 FAST-LIO 参数。
 
-> 飞行前必须使用本台 Airy 的 LiDAR–IMU 标定值，并完成录包回放、点云
-> 重影检查和地面低动态测试。仓库中的外参只是标称初值。
+> 飞行前必须使用本台 Airy 的 LiDAR–IMU 标定值，另行标定 Airy 内部 IMU 到
+> 飞机 `base_link`/重心的安装外参，并完成录包回放、点云重影和拆桨失效测试。
+> 当前外部位姿约 10 Hz，尚未达到本项目 30 Hz 的保守飞行验收门槛。
 
 ## 1. 项目结构与数据流
 
@@ -30,9 +31,31 @@ Airy
     fastlio_mapping
       ├─ /Odometry
       ├─ /cloud_registered
-      ├─ /cloud_registered_body
-      └─ /Laser_map
+      └─ /cloud_registered_body
 ```
+
+飞机端综合链路在此基础上继续为：
+
+```text
+/Odometry（camera_init -> Airy 内部 IMU body）
+          │
+          ▼
+fastlio_to_mavros.py
+  ├─ Airy IMU -> 飞机 base_link/FLU 安装外参
+  ├─ 飞控未解锁时的静止世界对齐与双 IMU 重力检查
+  ├─ 时间戳、新鲜度、频率、跳变、断流与 timesync 门控
+  └─ /liu/mavros/vision_pose/pose（ROS ENU/FLU）
+          │
+          ▼
+MAVROS（ENU/FLU -> PX4 NED/FRD）
+          │
+          ▼
+PX4 EKF2 外部视觉位置
+```
+
+桥接器会让飞机外部视觉原点在启动对齐时归零，但不会重置 PX4 home/EKF。它保留
+FAST-LIO 测量时间，不重复旧位姿、不伪造高频；断流、时间回退或对齐后突跳会停发
+并锁存故障，排障后必须重启综合脚本。Position 模式与解锁仍由遥控器控制。
 
 常用文件：
 
@@ -46,11 +69,17 @@ Airy
 | `shfile/install_fastlio2_Airy.sh` | 安装依赖并编译驱动和 FAST-LIO |
 | `shfile/setup_fastlio2_Airy.bash` | 加载当前 CPU 架构的运行环境 |
 | `shfile/check_airy_topics.sh` | 自动检查点云、IMU、字段和时间戳 |
+| `shfile/start_airy_px4.sh` | 飞机定位链路综合一键启动与会话记录 |
+| `shfile/stop_airy_px4.sh` | 精确停止飞机定位链路相关进程 |
+| `shfile/airy_px4.env.example` | 单机串口、安装外参与安全门控模板 |
+| `shfile/fastlio_to_mavros.py` | ENU/FLU 坐标桥与失效保护 |
+| `shfile/monitor_airy_px4.py` | FAST-LIO/MAVROS/PX4 只读状态监控 |
 | `environment/RSView_ubu20_4.3.15_0514/` | x86-64 版 RSView |
 
 本项目为 Airy 增加了 `lidar_type: 5`，接收标准
 `sensor_msgs/PointCloud2`。驱动必须使用 `XYZIRT` 点型，其中 `ring` 和
-`timestamp` 用于逐点运动补偿，不能改回 `XYZI`。
+`timestamp` 均会保留；Airy 预处理器使用逐点 `timestamp` 做运动补偿，不能
+改回 `XYZI`。
 
 ## 2. 接线、供电与网络
 
@@ -166,7 +195,7 @@ cd /home/liu/study/FAST_LIO
 bash shfile/install_fastlio2_Airy.sh
 ```
 
-RK3588 或内存较小的平台推荐：
+Jetson Orin 或内存较小的平台推荐：
 
 ```bash
 bash shfile/install_fastlio2_Airy.sh --jobs 2
@@ -175,6 +204,29 @@ bash shfile/install_fastlio2_Airy.sh --jobs 2
 如果编译器因内存不足被杀死，改为 `--jobs 1`。有桌面的调试电脑可使用
 `--desktop-full` 安装 RViz；APT 索引刚更新过时可使用
 `--skip-apt-update`。
+
+默认模式安装 `libpcap-dev`，同时支持在线 UDP 和驱动直接读取 PCAP。若只使用
+在线 Airy，可以不安装 libpcap：
+
+```bash
+bash shfile/install_fastlio2_Airy.sh --online-only --jobs 2
+```
+
+依赖已经完整安装、只需增量编译时，可保证不调用 `sudo/apt`：
+
+```bash
+bash shfile/install_fastlio2_Airy.sh --build-only --online-only --jobs 2
+```
+
+若已有 NetworkManager 有线连接，也可以在完整安装时显式配置 Airy 专网：
+
+```bash
+bash shfile/install_fastlio2_Airy.sh --jobs 2 \
+  --configure-network '有线连接 1'
+```
+
+`--build-only` 不能与 `--configure-network` 同时使用。安装脚本要求 Ubuntu
+20.04 的 APT/ROS Noetic 软件源已经可用，并且不会在线补齐缺失源码。
 
 安装脚本会：
 
@@ -194,7 +246,7 @@ bash shfile/install_fastlio2_Airy.sh --jobs 2
 environment/rslidar_ws/devel/noetic-amd64/
 build/noetic-amd64-airy/devel/
 
-# arm64 / RK3588
+# arm64 / Jetson Orin
 environment/rslidar_ws/devel/noetic-arm64/
 build/noetic-arm64-airy/devel/
 ```
@@ -259,7 +311,7 @@ bash shfile/check_airy_topics.sh
 | Ping | 0% 丢包，约 0.15 ms |
 | `/rslidar_points` | 约 10 Hz |
 | `/rslidar_imu_data` | 约 200 Hz |
-| 单帧原始点数 | 约 72,000，随环境变化 |
+| 单帧原始点数 | 本次约 56,000～60,000，随场景变化 |
 
 自检通过后，在终端一按一次 `Ctrl+C`，避免两个驱动同时占用 UDP 端口。
 
@@ -304,8 +356,9 @@ rostopic echo -n 1 /Odometry/header
 | `/Odometry` | FAST-LIO 位姿和里程计 |
 | `/cloud_registered` | 世界坐标系下的配准点云 |
 | `/cloud_registered_body` | 当前机体坐标系点云 |
-| `/Laser_map` | 地图点云 |
-| `/cloud_effected` | 参与状态估计的有效点 |
+
+当前源码虽然注册了 `/Laser_map` 和 `/cloud_effected` publisher，但相应发布调用
+已注释；`path_en: false` 时 `/path` 也不发布，不能用这些话题判定算法失败。
 
 如果驱动已在其他 launch 中运行，或正在回放 rosbag：
 
@@ -313,9 +366,54 @@ rostopic echo -n 1 /Odometry/header
 roslaunch fast_lio mapping_airy.launch start_driver:=false
 ```
 
+### 4.3 飞机端综合启动（先诊断）
+
+一键安装脚本也会安装 MAVROS、MAVROS extras、诊断消息、NumPy 与 GeographicLib
+数据。飞控板上的 PX4 固件由飞控自行运行，Orin 只启动 MAVROS、Airy、FAST-LIO、
+坐标桥和监控器，不启动 PX4 SITL。首次装机执行：
+
+```bash
+cd /home/liu/study/FAST_LIO
+cp shfile/airy_px4.env.example shfile/airy_px4.env
+bash shfile/start_airy_px4.sh --diagnostic-only --test-seconds 30
+```
+
+脚本不会自动切模式、解锁、写 PX4 参数、起飞或发送 OFFBOARD 控制量。2026-08-27
+改参前诊断读到 `EKF2_AID_MASK=2`，当时未开启视觉位置；FAST-LIO 约 10 Hz，模板
+单位旋转下 Airy 与飞控 IMU 的重力夹角为 `178.73°`，所以视觉输出为 0。用户随后
+已设置 `EKF2_AID_MASK=24`、`EKF2_HGT_MODE=3`，但尚未由本项目在飞控重启后只读复核。
+PX4 v1.13 中 `24=EV_POS+EV_YAW`，`HGT_MODE=3` 为视觉高度；当前默认
+`ALLOW_VISION_YAW_FUSION=0` 会因 `24` 含视觉 yaw 而阻断整路视觉发布，并非只去掉
+yaw。参数定义见
+[PX4 v1.13 参数表](https://docs.px4.io/v1.13/en/advanced_config/parameter_reference)。
+
+FAST-LIO 使用 Airy 内置 IMU，但仅把消息 `frame_id` 改成 `base_link` 不会旋转实际
+数值。必须标定并数值应用 Airy IMU 到飞机 `base_link`/FLU 的完整旋转和到重心的
+杆臂，把 `camera_init` 世界系对齐到 ROS ENU，再由 MAVROS 正确转换到 PX4 NED/FRD；
+点云、IMU、位姿的时钟/频率、MAVROS timesync 和 `EKF2_EV_DELAY` 也必须实测正确。
+只有完成安装外参、方向/航向标定、拆桨方向/断流/失位测试并复核 PX4 实际融合状态
+后，才可考虑把 `ALLOW_VISION_YAW_FUSION` 改为 `1`。完整门控说明见
+`shfile/README.md`。
+
+只有完成上述工作并解决真实位姿频率低于 30 Hz 的问题后，才可在本机私有配置中
+请求发布；日常启动命令为：
+
+```bash
+bash shfile/start_airy_px4.sh
+```
+
+停止 Airy、FAST-LIO、桥接器、监控器和 MAVROS：
+
+```bash
+bash shfile/stop_airy_px4.sh
+```
+
+该脚本不会向 PX4 发送控制命令；它会优先按综合启动会话记录精确停止进程。启动器
+本次创建的 roscore 会随会话停止，复用的已有 ROS master 始终保留。
+
 ## 5. 使用 RSView 检查原始点云
 
-仓库内的 RSView 安装包只支持 x86-64，不能直接在 RK3588/ARM64 上运行。
+仓库内的 RSView 安装包只支持 x86-64，不能直接在 Jetson Orin/ARM64 上运行。
 
 ```bash
 cd /home/liu/study/FAST_LIO/environment/RSView_ubu20_4.3.15_0514
@@ -370,12 +468,18 @@ ARM 板端使用 `rslidar_sdk` 发布 ROS 话题，在远端电脑用 RViz 显�
 | `difop_port` | `7788` | 配置和标定端口 |
 | `imu_port` | `6688` | 内置 IMU 端口 |
 | `host_address` | `0.0.0.0` | 在本机接口接收 |
-| `use_lidar_clock` | `true` | 点云和 IMU 使用雷达时间 |
+| `use_lidar_clock` | `false` | 当前设备无 UTC 同步，点云/逐点时间/IMU 使用 Orin 主机时间 |
 | `wait_for_difop` | `true` | 收到 DIFOP 后再正常输出 |
 | `ros_frame_id` | `rslidar` | 原始消息坐标系 |
 
 默认话题是 `/rslidar_points` 和 `/rslidar_imu_data`。修改话题后，必须同步
 修改 `config/airy.yaml` 的 `lid_topic` 和 `imu_topic`。
+
+本机在线测试发现 Airy 设备时钟是开机相对秒，并非 Unix/UTC；若设为 `true`，
+`/Odometry` 会与 ROS/PX4 系统时间相差约 1787838951 秒，安全桥会拒绝数据。
+因此当前必须保持 `false`。只有为雷达配置并验证 PTP/GPS UTC 同步后，才可使用
+雷达时钟。`shfile/check_airy_topics.sh` 会检查点云 header、逐点 `timestamp` 和
+IMU 是否都在 ROS 当前时间附近，不能只检查点云与 IMU 彼此接近。
 
 ### 6.2 FAST-LIO 配置
 
@@ -419,7 +523,7 @@ P_imu = R_L_I × P_lidar + T_L_I
 
 `extrinsic_est_en: true` 不能代替正确的初始方向和基本标定。
 
-### 6.4 RK3588 性能参数
+### 6.4 Jetson Orin / ARM64 性能参数
 
 `launch/mapping_airy.launch` 的常用参数：
 
@@ -429,7 +533,7 @@ P_imu = R_L_I × P_lidar + T_L_I
 | `filter_size_surf` | `0.3` | 当前帧更稀疏 |
 | `filter_size_map` | `0.4` | 地图更稀疏、内存更低 |
 
-RK3588 负载过高时，可从 `point_filter_num=4～6`、
+Orin 或其他 ARM64 板端负载过高时，可从 `point_filter_num=4～6`、
 `filter_size_surf=0.4～0.6`、`filter_size_map=0.5～0.8` 开始测试。每次只改
 一类参数，并用同一个 rosbag 比较定位效果和资源占用。
 
@@ -489,9 +593,9 @@ pcd_save:
 开发板上使用正数分段保存。`interval: -1` 会累计全部点，长时间运行可能
 耗尽内存。结束时按一次 `Ctrl+C`，等待文件写完后再断电。
 
-## 8. RK3588 和多机 ROS
+## 8. Jetson Orin / ARM64 和多机 ROS
 
-RK3588 建议：
+Jetson Orin / ARM64 板端建议：
 
 - 使用 64 位 Ubuntu 用户空间，对应 `arm64`；
 - 编译从 `--jobs 2` 开始，内存不足时使用 `--jobs 1`；
@@ -541,6 +645,7 @@ source shfile/setup_fastlio2_Airy.bash
 | 点云重影或位姿方向错误 | 依次检查逐点时间戳、时钟、丢包和 LiDAR→IMU 外参 |
 | RSView 报 `libpcap...file too short` | 在 RSView 目录运行 `./repair_symlinks.sh` |
 | RSView 正常启动但没有点云 | 确认状态栏型号为 `RSAIRY`；在线雷达使用本地地址 `192.168.1.102`、组地址 `0.0.0.0`、端口 `6699/7788`，并先停止 ROS 驱动 |
+| APT 找不到 `ros-noetic-*` | 先按 ROS Noetic 官方方式配置 Ubuntu 20.04 软件源，再重新运行安装脚本 |
 | 停止驱动时出现 `std::system_error` | 若只在 `Ctrl+C` 退出阶段出现且进程正常结束，可忽略；运行中出现则继续排查 |
 | 编译出现 `Killed/cc1plus` | 使用 `--jobs 1`，关闭 RViz、浏览器等高内存程序 |
 
@@ -567,6 +672,6 @@ rostopic echo -n 1 /rslidar_points/fields
 - [ ] 已写入本台 Airy 的正确 LiDAR–IMU 外参；
 - [ ] 静止时里程计稳定，缓慢运动时点云无明显重影或分层；
 - [ ] 已完成原始 rosbag 记录和回放；
-- [ ] RK3588 在预期时长内没有过热、降频或内存耗尽；
+- [ ] Orin/ARM64 板端在预期时长内没有过热、降频或内存耗尽；
 - [ ] FAST-LIO 到机体/飞控坐标系的变换已单独标定；
 - [ ] 已完成地面低动态测试后再进入飞行测试。

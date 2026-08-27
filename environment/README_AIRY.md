@@ -18,6 +18,16 @@ Airy 配置在 `rslidar_sdk/config/config_airy.yaml`，默认接收端口为：
    `group_address` 为 `0.0.0.0`，表示驱动在本机接口上接收单播数据。
 4. 若雷达已配置为其他端口，只修改 `config_airy.yaml` 中对应端口即可。
 
+安装脚本也能显式配置一个已经存在的 NetworkManager 有线连接；默认安装不会
+自动修改网卡：
+
+```bash
+bash shfile/install_fastlio2_Airy.sh --jobs 2 \
+  --configure-network '有线连接 1' \
+  --host-cidr 192.168.1.102/24 \
+  --lidar-ip 192.168.1.200
+```
+
 可先用以下命令确认数据包确实到达开发板：
 
 ```bash
@@ -40,7 +50,13 @@ roslaunch fast_lio mapping_airy.launch
 timestamp` 字段。FAST-LIO Airy 预处理器会把绝对秒时间戳转换成每帧内的
 毫秒偏移，用于运动畸变补偿。不要改回默认的 `XYZI`。
 
-连接雷达后运行：
+当前这台 Airy 实测的设备时间是“开机相对时间”，不是 Unix/UTC：它与 Orin
+系统时间相差约 1787838951 秒，不能直接送入 MAVROS/PX4。因此驱动配置固定为
+`use_lidar_clock: false`，点云、逐点时间和 IMU 使用 Orin 主机时间轴。只有在
+雷达已通过 PTP/GPS 得到 UTC、并用自检确认与 ROS 系统时间误差小于 1 秒后，
+才允许改回 `true`。
+
+连接雷达后运行；自检会同时检查 header、逐点时间和 IMU 是否接近 ROS 当前时间：
 
 ```bash
 bash shfile/check_airy_topics.sh

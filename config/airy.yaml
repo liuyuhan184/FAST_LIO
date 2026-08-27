@@ -7,7 +7,7 @@ common:
 preprocess:
     lidar_type: 5                # 5: RoboSense XYZIRT (Airy)
     scan_line: 96                # Airy model is auto-detected by rslidar_sdk; raw mode does not use this value
-    timestamp_unit: 0            # Airy handler reads absolute timestamp in seconds and normalizes it internally
+    timestamp_unit: 0            # XYZIRT contains absolute host-clock seconds; handler converts to per-frame offsets
     blind: 0.5
 
 mapping:
