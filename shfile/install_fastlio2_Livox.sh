@@ -47,13 +47,13 @@ die() {
 usage() {
   cat <<'EOF'
 用法：
-  bash shfile/install_fastlio2.sh [选项]
+  bash shfile/install_fastlio2_Livox.sh [选项]
 
 选项：
   --jobs N                 指定并行编译任务数
   --skip-apt-update        跳过 apt-get update
   --desktop-full           额外安装 ros-noetic-desktop-full（板端通常不需要）
-  --allow-unsupported-os   允许在非 Ubuntu 20.04 系统上尝试部署
+  --allow-unsupported-os   允许在非 20.04 的其他 Ubuntu 版本上尝试部署
   -h, --help               显示帮助
 
 也可使用环境变量 BUILD_JOBS、SKIP_APT_UPDATE、INSTALL_DESKTOP_FULL 和
@@ -368,7 +368,7 @@ verify_installation() {
   info "动态库、ROS 包索引和 FAST-LIO launch 文件验证通过。"
   printf '\n%s部署完成。%s\n' "${COLOR_GREEN}" "${COLOR_RESET}"
   printf '当前平台：%s / %s\n' "${PRETTY_NAME}" "${DPKG_ARCH}"
-  printf '环境加载：source %q\n' "${SCRIPT_DIR}/setup_fastlio2.bash"
+  printf '环境加载：source %q\n' "${SCRIPT_DIR}/setup_fastlio2_Livox.bash"
   printf 'FAST-LIO（板端无界面）：roslaunch fast_lio mapping_avia.launch rviz:=false\n'
   printf 'Livox 驱动：roslaunch livox_ros_driver livox_lidar_msg.launch\n'
 }

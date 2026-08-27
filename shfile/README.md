@@ -1,340 +1,579 @@
-# FAST-LIO2 一键部署脚本
+# `shfile` 脚本接口与运行参考
 
-本目录同时保留 Livox 与 RoboSense Airy 两套部署脚本。Airy 主线已在 NVIDIA
-Jetson Orin NX（Ubuntu 20.04 + ROS Noetic，`arm64`）实测，也支持 `amd64`、
-`i386` 和 `armhf` 目标机原生编译。
+本目录提供 RoboSense Airy + FAST-LIO2 + MAVROS/PX4 的安装、环境、自检、标定、桥接、
+监控和综合启停工具。本文件是脚本接口参考；从零部署请阅读
+[快速部署与操作手册](../README.md)，算法、坐标系、参数和二次开发说明见
+[完整项目与二次开发手册](../AIRY_FASTLIO_MANUAL.md)。
 
-Airy 从接线、网络配置到编译、运行、录包、调参和故障排查的完整说明见
-项目根目录的 `AIRY_FASTLIO_MANUAL.md`。
+> 涉及飞机的首次测试必须拆下全部桨叶、固定机体并保持飞控未解锁。脚本不会自动切换
+> 模式、解锁、起飞、写 PX4 参数或发送 OFFBOARD 控制量。
 
-## RoboSense Airy（当前方案）
+## 1. 文件索引
 
-源码及配置位于：
+| 文件 | 用途 | 是否直接运行 |
+| --- | --- | --- |
+| `install_fastlio2_Airy.sh` | 安装依赖、可选配置雷达网口、构建 Airy 驱动和 FAST-LIO | `bash` |
+| `setup_fastlio2_Airy.bash` | 加载 ROS Noetic、驱动和 FAST-LIO 分架构 overlay | 必须 `source` |
+| `check_airy_topics.sh` | 检查一条 Airy 点云/IMU、XYZIRT 字段和时间轴 | `bash` |
+| `99-fastlio-airy.conf` | Airy UDP 接收缓冲 sysctl 模板 | 由安装脚本安装 |
+| `airy_px4.env.example` | 飞机连接、外参、安全门和质量阈值模板 | 复制后编辑 |
+| `start_airy_px4.sh` | 综合启动 roscore、MAVROS、FAST-LIO、桥和监控 | `bash` |
+| `stop_airy_px4.sh` | 按会话元数据精确停止综合链路 | `bash` |
+| `fastlio_to_mavros.py` | FAST-LIO 到飞机 ENU/FLU 位姿桥与失效保护 | 由启动器调用 |
+| `monitor_airy_px4.py` | 只读链路/PX4 状态监控 | 由启动器调用 |
+| `calibrate_airy_body.py` | 双 IMU 三轴动态估计 Airy IMU 到飞机 FLU 的旋转 | 手工运行 |
+| `install_fastlio2_Livox.sh` | 保留的 Livox 安装构建链路 | `bash` |
+| `setup_fastlio2_Livox.bash` | 保留的 Livox 环境加载 | 必须 `source` |
+
+运行时生成的 `airy_px4.env`、构建目录和 `runtime/` 已被 `.gitignore` 排除。
+
+## 2. 最常用命令
+
+```bash
+# 新机安装/编译
+bash shfile/install_fastlio2_Airy.sh --jobs 2
+
+# 手工运行 ROS 命令前加载环境
+source shfile/setup_fastlio2_Airy.bash
+
+# 驱动已启动时检查 Airy 输入
+bash shfile/check_airy_topics.sh
+
+# 第一次创建本机飞机配置
+cp shfile/airy_px4.env.example shfile/airy_px4.env
+
+# 拆桨、未解锁，只诊断 30 秒
+bash shfile/start_airy_px4.sh --diagnostic-only --test-seconds 30
+
+# 拆桨、未解锁，限时请求发布 90 秒
+bash shfile/start_airy_px4.sh --publish-vision --test-seconds 90
+
+# 日常持续启动；仍受私有配置和全部硬门约束
+bash shfile/start_airy_px4.sh
+
+# 查看运行状态
+bash shfile/start_airy_px4.sh --status-only
+
+# 预览并停止
+bash shfile/stop_airy_px4.sh --dry-run
+bash shfile/stop_airy_px4.sh
+```
+
+综合启动器会自行加载 Airy 环境；在另一个终端执行 `rostopic`、`roslaunch`、`rosbag`
+或标定器前仍应 `source shfile/setup_fastlio2_Airy.bash`。
+
+## 3. Airy 安装脚本
+
+### 3.1 接口
 
 ```text
-environment/rslidar_sdk/              # 官方 SDK/ROS1 驱动，固定 v1.5.19
-environment/rslidar_sdk/src/rs_driver # 官方驱动子模块
-environment/rslidar_sdk/config/config_airy.yaml
-config/airy.yaml
-launch/mapping_airy.launch
+bash shfile/install_fastlio2_Airy.sh [选项]
 ```
 
-在 FAST_LIO 根目录执行：
+| 选项 | 作用 |
+| --- | --- |
+| `--jobs N` | 指定正整数并行编译数 |
+| `--build-only` | 不调用 sudo/apt，只检查依赖并构建 |
+| `--online-only` | 关闭 PCAP 解析，不要求 `libpcap-dev` |
+| `--skip-apt-update` | 安装依赖前跳过 `apt-get update` |
+| `--desktop-full` | 安装 `ros-noetic-desktop-full`，包含 RViz |
+| `--allow-unsupported-os` | 在非 20.04 的其他 Ubuntu 版本尝试，不支持其他发行版 |
+| `--configure-network NAME` | 修改明确指定的 NetworkManager 有线连接 |
+| `--host-cidr IPv4/PREFIX` | 板端雷达专网地址，默认 `192.168.1.102/24` |
+| `--lidar-ip IPv4` | 连通检查目标，默认 `192.168.1.200` |
+| `-h`、`--help` | 显示脚本内权威帮助 |
 
-```bash
-bash shfile/install_fastlio2_Airy.sh
+对应环境变量包括 `BUILD_JOBS`、`SKIP_APT_UPDATE`、`INSTALL_DESKTOP_FULL`、
+`ALLOW_UNSUPPORTED_UBUNTU`、`BUILD_ONLY`、`ONLINE_ONLY`、`AIRY_HOST_CIDR` 和
+`AIRY_LIDAR_IP`。网卡连接名只能通过 `--configure-network` 明确传入，避免误改接口。
+
+### 3.2 行为和副作用
+
+默认完整运行会：
+
+1. 检查 Ubuntu、ROS 发行版、CPU 架构和仓库源码；
+2. 通过 APT 安装 ROS/PCL/Eigen/MAVROS/NumPy/GeographicLib 等依赖；
+3. 安装 MAVROS GeographicLib 数据；
+4. 可选修改指定 NetworkManager 连接；
+5. 把 `99-fastlio-airy.conf` 安装到 `/etc/sysctl.d/` 并应用；
+6. 以 Release、`XYZIRT`、`ENABLE_IMU_DATA_PARSE=ON` 构建驱动；
+7. 以 Release、`ENABLE_LIVOX_SUPPORT=OFF` 构建 Airy FAST-LIO；
+8. 检查动态库、CMake cache、ROS launch、Shell/Python 语法和 Python 自测。
+
+脚本重复运行会复用源码和做增量构建。它不会克隆缺失的项目源码，也不会添加 ROS APT
+软件源。
+
+`--build-only` 不使用 sudo/apt，也不能与 `--configure-network` 同用；但它仍会更新
+构建文件。`--online-only` 与默认 PCAP 构建使用不同宏，切换后脚本会重新配置。
+
+### 3.3 输出路径
+
+构建标签为 `noetic-<dpkg架构>`：
+
+```text
+environment/rslidar_ws/build/noetic-<arch>/
+environment/rslidar_ws/devel/noetic-<arch>/
+build/noetic-<arch>-airy/
 ```
 
-默认模式会获取 sudo 权限并安装系统依赖，然后把官方驱动编译为 `XYZIRT` 点型、
-开启 Airy IMU 解析及 PCAP 支持，最后编译不依赖 Livox 消息包的 FAST-LIO2。
-每种 CPU 架构使用独立构建目录，不会混用 x86 与 ARM 产物。运行前要求 Ubuntu
-20.04 的 APT/ROS Noetic 软件源可用，脚本不会自行添加软件源或下载缺失源码。
+不要跨 amd64/ARM64 复制构建产物。Orin 编译被系统杀死时使用 `--jobs 1`。
 
-Orin 或内存较紧的平台可限制并行度：
+## 4. Airy 环境脚本
 
-```bash
-bash shfile/install_fastlio2_Airy.sh --jobs 2
-```
-
-安装完成后启动驱动与建图：
+正确用法：
 
 ```bash
 source shfile/setup_fastlio2_Airy.bash
-roslaunch fast_lio mapping_airy.launch
 ```
 
-也可以先只启动驱动，再用自检脚本确认点云和 IMU：
+直接执行会报错。脚本拒绝与已经加载的其他 ROS 发行版混用，自动选择当前架构 overlay，
+并导出：
+
+- `FAST_LIO_ROOT`；
+- `RSLIDAR_SDK_ROOT`；
+- `RSLIDAR_WS`。
+
+默认行为是清除陈旧 `ROS_IP/ROS_HOSTNAME`，并使用本机 master：
+
+```text
+ROS_MASTER_URI=http://127.0.0.1:11311
+```
+
+有意使用远端 ROS master 时，必须在加载前设置：
+
+下面的地址只是示例，必须换成真实管理网地址：
 
 ```bash
-roslaunch rslidar_sdk start_airy.launch
-# 在另一个终端执行
+export AIRY_KEEP_ROS_NETWORK=1
+export ROS_MASTER_URI=http://192.168.31.10:11311
+export ROS_IP=192.168.31.20
+source shfile/setup_fastlio2_Airy.bash
+```
+
+这只适用于手工 `source` 后运行的 ROS 命令。综合 `start_airy_px4.sh` 会清除显式
+`ROS_IP/ROS_HOSTNAME`，只保留 `ROS_MASTER_URI`；其权威支持拓扑是本机 master。若要
+让综合栈使用远端 master，必须先改造并验证所有节点的回连地址。
+
+## 5. Airy 话题自检
+
+驱动已经启动后运行：
+
+```bash
 source shfile/setup_fastlio2_Airy.bash
 bash shfile/check_airy_topics.sh
 ```
 
-无人机板端默认不启动 RViz。在有桌面环境的电脑上可使用：
+脚本检查：
+
+- ROS master 可达；
+- `/rslidar_points` 和 `/rslidar_imu_data` 存在；
+- 一条点云非空，字段包含 `x/y/z/intensity/ring/timestamp`；
+- 一条 IMU 数值有限；
+- 点云 header、逐点 timestamp、IMU 和 ROS 当前时间没有明显跨纪元。
+
+它只取少量/单条消息，不证明 10 分钟持续频率、网络无丢包或 FAST-LIO 精度。通过后还
+要使用 `rostopic hz`、`ip -s link` 和 UDP 统计做长测。
+
+## 6. 飞机本机配置
+
+### 6.1 创建和安全属性
 
 ```bash
-roslaunch fast_lio mapping_airy.launch rviz:=true
-```
-
-## 飞机端综合一键启动（Airy + FAST-LIO + MAVROS/PX4）
-
-[`start_airy_px4.sh`](start_airy_px4.sh) 面向当前 Orin + 飞控装机方案，一次启动：
-
-```text
-Airy 点云/IMU -> FAST-LIO /Odometry
-                           |
-                           v
-                 坐标变换与失效门控
-                           |
-                           v
-              /liu/mavros/vision_pose/pose
-                           |
-                           v
-                  MAVROS -> PX4 EKF2
-```
-
-PX4 固件运行在飞控板上，Orin 不需要也不应启动 PX4 SITL。综合脚本启动的是
-`/dev/ttyTHS0:921600` 上的 MAVROS 链路、雷达 SLAM、数据桥和只读监控器。
-
-### 首次使用：只诊断，不向飞控发送位姿
-
-一键安装脚本现在也会安装 MAVROS、MAVROS extras、诊断消息、NumPy 和
-GeographicLib 数据。安装/增量编译后先复制本机配置：
-
-```bash
-cd /home/liu/study/FAST_LIO
 cp shfile/airy_px4.env.example shfile/airy_px4.env
-bash shfile/start_airy_px4.sh --diagnostic-only --test-seconds 30
 ```
 
-`shfile/airy_px4.env` 是单机标定文件，已被 Git 忽略。第一次不复制也能运行诊断，
-但安全默认值会保持 `PUBLISH_VISION=0`、`MOUNT_CONFIRMED=0`，桥接器不会向
-MAVROS 发布未经标定的位姿。
+`airy_px4.env` 被 Git 忽略，应按“本机 + 本架飞机”独立维护。迁移到新 Orin、换雷达
+安装位或换飞机时，必须安全迁移并复核，或重新标定。
 
-当前板端已确认的硬件与改参前诊断基线为：
+启动器用 Bash `source` 读取该文件，因此它是可信 Shell 配置，不是允许任意外来内容的
+普通数据文件。推荐只写简单 `KEY=value`；不要从不可信来源复制命令替换、函数或其他
+Shell 代码。
 
-| 项目 | 当前实测 |
-| --- | --- |
-| 飞控串口 | `/dev/ttyTHS0:921600`，用户 `liu` 属于 `dialout` |
-| 飞控/MAVROS | PX4 v1.13.3，MAVROS 已连接，时间同步 RTT 约 1.3 ms |
-| 启动测试状态 | `connected=true`、`armed=false`；测试时为 `ALTCTL`，脚本不切模式 |
-| PX4 融合参数（旧诊断） | 当时 `EKF2_AID_MASK=2`，没有开启视觉位置 |
-| 活动估计器 | `SYS_MC_EST_GROUP=2`，EKF2 |
-| 外部视觉延迟（旧诊断） | `EKF2_EV_DELAY=175 ms`，尚需 PX4 日志实测调节 |
-| FAST-LIO 位姿 | 约 10 Hz；满足算法现状，但低于飞行验收使用的 30 Hz 门槛 |
-| 安装方向诊断 | 单位四元数占位值下双 IMU 重力夹角 `178.73°`，该占位值明确不可用 |
-
-以上表格记录的是 2026-08-27 改参前的实测，不能当作飞控当前参数快照。用户随后
-已设置 `EKF2_AID_MASK=24` 和 `EKF2_HGT_MODE=3`，但尚未由本项目在飞控重启后复跑
-只读诊断。PX4 v1.13 中 `24=8+16`，即 `EV_POS + EV_YAW`；`HGT_MODE=3` 表示视觉
-高度。参数定义可查阅
-[PX4 v1.13 参数表](https://docs.px4.io/v1.13/en/advanced_config/parameter_reference)。
-
-新值写入不等于已经可飞 Position：默认 `ALLOW_VISION_YAW_FUSION=0`，而 `24` 包含
-视觉 yaw，因此启动器会将整路视觉发布保持关闭并继续显示非就绪状态；它不会只丢弃
-yaw 后继续发布位置。必须在完成安装外参、方向/航向和拆桨测试后才可考虑放开该门控。
-
-修正后的综合脚本已在本机完成一次 30 秒全链路测试：只读同步 PX4 参数 907 项，
-FCU 全程 `armed=false`，FAST-LIO 合法位姿约 10.01 Hz、时间年龄约 0.008 秒，
-MAVROS timesync RTT 约 1.30 ms、偏移标准差约 0.014 ms；安全门控使视觉输出保持
-0 Hz，测试断言通过后所有自启进程均被清理。Airy 主机时间自检还确认单帧逐点时间
-跨度约 0.099793 秒，点云/逐点时间/IMU 都在 Orin 当前时间附近。
-
-随后进行的 10 秒复验仍保持 `armed=false`、模式 `ALTCTL`，FAST-LIO 输入约
-10.02 Hz，timesync 正常；新增的被动双 IMU 检查测得单位四元数占位值下重力夹角
-为 `178.73°`。这证明当前传感器方向不能使用模板里的单位旋转。重力检查只能约束
-横滚/俯仰，不能判断航向，也不能仅凭该数值判断应绕 X 轴还是 Y 轴旋转 180°；必须
-先确认 Airy 原始 IMU 与 MAVROS IMU 的比力符号/坐标约定，再依据实际装机方向标定
-完整四元数并做拆桨方向测试。
-
-本次测试也发现并修正了 Airy 默认设备时钟问题：该设备当前给出开机相对时间而非
-UTC，所以 `environment/rslidar_sdk/config/config_airy.yaml` 必须保持
-`use_lidar_clock: false`。若未经 PTP/GPS 同步改成 `true`，桥会因位姿时间与 ROS/PX4
-相差约 1787838951 秒而拒绝数据。
-
-### 必须填写的安装外参
-
-`config/airy.yaml` 的外参是“Airy 激光雷达到 Airy 内部 IMU”，并不是传感器到
-飞机的安装外参。飞机配置还必须给出：
+可以使用其他配置文件：
 
 ```bash
-# 四元数 [x,y,z,w]：Airy 内部 IMU I -> 飞机 ROS base_link/FLU B
-SENSOR_TO_BODY_Q_X=...
-SENSOR_TO_BODY_Q_Y=...
-SENSOR_TO_BODY_Q_Z=...
-SENSOR_TO_BODY_Q_W=...
-
-# Airy IMU 原点相对飞机控制/重心原点的位置，单位 m，表达在 base_link/FLU
-SENSOR_POSITION_IN_BODY_X=...
-SENSOR_POSITION_IN_BODY_Y=...
-SENSOR_POSITION_IN_BODY_Z=...
+bash shfile/start_airy_px4.sh --config /absolute/path/aircraft.env
+bash shfile/stop_airy_px4.sh  --config /absolute/path/aircraft.env
 ```
 
-FAST-LIO 使用的是 Airy 内置 IMU，因而 `/Odometry` 的 `body` 是 Airy IMU 机体系，
-不是飞机 `base_link`。只把 `frame_id`/`child_frame_id` 改成 `base_link` 不会改变
-任何向量或姿态数值，属于错误做法。桥接前必须真实完成：
+### 6.2 连接变量
+
+| 变量 | 模板值/含义 |
+| --- | --- |
+| `UAV_NAME` | `liu`；形成 `/<UAV_NAME>/mavros`，可改为合法 ROS 名 |
+| `FCU_URL` | `/dev/ttyTHS0:921600`；按实际设备修改 |
+| `GCS_URL` | 默认空；需要时填明确 QGC UDP 地址 |
+| `MAV_SYS_ID`、`MAV_COMP_ID` | MAVLink system/component ID |
+| `EXPECTED_PX4_MAJOR/MINOR` | 当前默认 `1/13`，用于固件硬门 |
+
+模板中的用户名式 namespace 只是默认值，不是协议要求。改名后标定器的默认 MAVROS
+话题也要用参数覆盖。
+
+### 6.3 组件开关
+
+| 变量 | `1` 时 | `0` 时的前提 |
+| --- | --- | --- |
+| `START_ROSCORE` | 创建或复用 master | 必须已有可达 master |
+| `START_MAVROS` | 启动本会话 MAVROS | 必须已有 `/<UAV>/mavros` 且 FCU connected |
+| `START_FASTLIO` | 启动 Airy + FAST-LIO | 仍须在启动器规定的等待窗口内看到 `/Odometry` |
+| `START_BRIDGE` | 启动位姿桥 | 为 0 时视觉发布被禁止 |
+| `START_MONITOR` | 启动只读监控 | 为 0 时视觉发布被禁止 |
+
+这些开关用于复用已有组件，不是多 UAV 隔离机制。整套脚本按单机、单 UAV、单定位栈
+设计。
+
+### 6.4 发布安全门
+
+| 变量 | 含义 |
+| --- | --- |
+| `PUBLISH_VISION` | 请求发布；单独设 1 不足以真正发布 |
+| `MOUNT_CONFIRMED` | 安装旋转和杆臂已填写并人工复核 |
+| `DIRECTION_TEST_CONFIRMED` | 拆桨正方向/符号和失效测试已完成 |
+| `ALLOW_APPROXIMATE_DIRECTION_PUBLISH` | 允许方向未确认时持续发布的高风险豁免；有界测试不需要它 |
+| `ALLOW_VISION_YAW_FUSION` | PX4 AID mask 包含 EV yaw 时的额外许可 |
+
+推荐状态推进：
 
 ```text
-Airy IMU I --安装旋转/杆臂--> base_link/FLU B
-camera_init --静止世界对齐--> ROS ENU --MAVROS--> PX4 NED/FRD
+全部 0
+  -> diagnostic-only
+  -> 双 IMU 标定、杆臂测量
+  -> MOUNT_CONFIRMED=1
+  -> 限时拆桨方向测试
+  -> DIRECTION_TEST_CONFIRMED=1
+  -> 正式请求 PUBLISH_VISION=1
 ```
 
-除旋转和杆臂外，还必须确保 Airy 点云/IMU/FAST-LIO 位姿时钟一致，点云约 10 Hz、
-IMU 约 200 Hz 且无断流，MAVROS timesync 正常，并用 PX4 日志校准外部视觉频率、
-延迟和创新量。修改消息标签不能替代这些数值变换与时序验证。
+`--test-seconds N` 本身允许在 `DIRECTION_TEST_CONFIRMED=0` 时做有界真实发布，其他门
+仍必须全部通过，此时应保持 `ALLOW_APPROXIMATE_DIRECTION_PUBLISH=0`。把该变量设为
+`1` 会允许 `TEST_SECONDS=0` 的方向未确认持续发布；它不会把方向状态伪装成已确认，
+监控仍会告警，不应成为日常或飞行配置。
 
-完成实测/标定后才能设置 `MOUNT_CONFIRMED=1`。桥会在飞控未解锁且飞机静止时，
-利用飞控姿态把 FAST-LIO 的任意 `camera_init` 世界系对齐到 ROS ENU，并检查两颗
-IMU 的重力方向是否与安装旋转一致。它还会把 Airy IMU 的轨迹补偿到飞机原点。
-因此 PX4 的 `EKF2_EV_POS_X/Y/Z` 必须保持 0，不能再做第二次杆臂补偿。
+### 6.5 外参和阈值
 
-当前模板中的单位四元数已被实测判定错误（重力夹角 `178.73°`），只能作为使配置
-格式完整的禁用占位值，绝不能把 `MOUNT_CONFIRMED` 改为 1 后继续使用。
-
-### PX4 参数只读门控
-
-启动器只调用参数读取接口，**不会**调用 `param/set`。在 QGroundControl 中由操作者
-确认外部位置源方案后配置 PX4 v1.13：
-
-- `EKF2_AID_MASK` 的 value `8`（bit 3）必须开启视觉位置；
-- 改参前诊断值 `2` 是光流；用户现已设置但尚待复核的 `24=8+16`，同时请求视觉
-  位置和视觉 yaw；
-- 用户已设置但尚待复核的 `EKF2_HGT_MODE=3` 表示视觉高度，修改后需重启飞控并
-  检查高度融合、复位和失位降级行为；
-- FAST-LIO 航向未独立标定时，不得放开 value `16` 的视觉 yaw。默认
-  `ALLOW_VISION_YAW_FUSION=0` 会让含 bit 4 的 `24` 阻断整路视觉发布；只有完成安装
-  外参、方向/航向标定与拆桨测试后才可改为 `1`；
-- 当前桥不发送速度，不得开启 value `256` 的视觉速度；
-- 桥已经输出 ROS ENU 并由 MAVROS 转为 PX4 NED，不应再开启 value `64` 的外部
-  视觉旋转；
-- `EKF2_EV_DELAY` 应根据 PX4 日志和创新量调节，不能凭猜测自动填写；
-- 参数写入值、EKF 实际融合状态、失位后的降级行为以及解锁前检查必须在
-  QGroundControl/PX4 日志中单独确认。
-
-修改需要重启的 PX4 参数后，重启飞控，再重新运行诊断。不要通过关闭 EKF 解锁
-检查或断路器来掩盖定位错误。
-
-### 请求发布与日常一键启动
-
-完成安装外参、PX4 参数、拆桨方向检查后，在 `shfile/airy_px4.env` 中设置：
-
-```bash
-MOUNT_CONFIRMED=1
-DIRECTION_TEST_CONFIRMED=1
-PUBLISH_VISION=1
+```text
+SENSOR_TO_BODY_Q_X/Y/Z/W
 ```
 
-若只读复核仍为 `EKF2_AID_MASK=24`，只有在视觉航向独立标定和拆桨航向测试也通过
-后才能再设置 `ALLOW_VISION_YAW_FUSION=1`。否则保持默认 `0`，启动器将继续阻断
-视觉发布；不要为了消除告警直接绕过门控。
+是把 Airy 内部 IMU 向量旋转到飞机 `base_link`/FLU 的四元数，顺序为 `xyzw`。
 
-随后日常启动只有一条命令：
-
-```bash
-cd /home/liu/study/FAST_LIO
-bash shfile/start_airy_px4.sh
+```text
+SENSOR_POSITION_IN_BODY_X/Y/Z
 ```
 
-停止整套伴随计算机链路：
+是从项目明确选定的飞机 `base_link` 原点到 Airy IMU 原点的向量，表达在 FLU，单位
+米。重心、飞控 IMU 原点和机架几何中心不能混称；应先统一本机定义。桥已补偿杆臂，
+因此 PX4 `EKF2_EV_POS_X/Y/Z` 应为零。
 
-```bash
-bash shfile/stop_airy_px4.sh
+质量参数的模板默认值和启动器允许范围如下；超出范围会在访问硬件前直接退出：
+
+| 参数 | 默认值 | 允许范围 | 含义 |
+| --- | ---: | ---: | --- |
+| `MIN_FASTLIO_RATE_HZ` | `8.0` | `8～100` | 允许持续发布的最低 LIO 频率 |
+| `FLIGHT_MIN_POSE_RATE_HZ` | `30.0` | `30～100` | 项目飞行验收门槛；当前约 10 Hz 未达到 |
+| `MIN_LOCAL_POSE_RATE_HZ` | `2.0` | `1～20` | PX4 下行本地位姿持续性门槛 |
+| `ALIGN_STABLE_SECONDS` | `5.0` | `5～60` | 静止世界对齐时长 |
+| `MAX_SOURCE_AGE_S` | `0.5` | `0.05～0.5` | 源测量最大年龄 |
+| `MAX_SOURCE_GAP_S` | `0.30` | `0.3～1.0` | 相邻 header 时间最大间隔 |
+| `MAX_RECEIPT_STALL_S` | `0.50` | `0.5～2.0` | ROS 回调/进程接收最大停顿 |
+| `MAX_POSITION_JUMP_M` | `1.0` | `0.05～5` | 对齐后单步位置跳变限制 |
+| `MAX_ORIENTATION_JUMP_DEG` | `45.0` | `1～90` | 单步姿态跳变限制 |
+| `MAX_GRAVITY_MISMATCH_DEG` | `10.0` | `1～15` | 双 IMU 重力最大夹角 |
+
+源 header 缺帧和本机调度停顿是两个独立故障，不应通过一起放宽来掩盖网络丢包。
+
+## 7. 综合启动器
+
+### 7.1 命令行
+
+```text
+bash shfile/start_airy_px4.sh [选项]
 ```
 
-停止脚本优先使用会话 PID、启动时间和进程组清单；只有清单不存在时，才按本项目
-绝对路径和 `/${UAV_NAME}/mavros` 命名空间清理当前用户的本机残留。它不会向飞控
-发送模式、解锁或参数命令，可以重复执行，没有相关进程时也正常返回。启动器本次
-创建的 roscore 会写入清单并随会话停止；复用的已有 ROS master 始终保留。
+| 选项 | 行为 |
+| --- | --- |
+| `--config FILE` | 使用指定私有配置 |
+| `--diagnostic-only` | 强制禁发，只做整链路诊断 |
+| `--publish-vision` | 请求发布，仍须通过全部硬门 |
+| `--test-seconds N` | 运行 N 秒未解锁台架测试后自动收集状态并退出；N 至少 10 |
+| `--dry-run` | 打印解析后的配置和计划，不访问硬件 |
+| `--status-only` | 不启停组件，只读取当前 MAVROS/bridge/monitor ROS 链路状态 |
+| `-h`、`--help` | 显示帮助 |
 
-命令行的 `--publish-vision` 也只能提出发布请求，不能绕过安装外参、PX4 融合位、
-重复杆臂补偿、视觉 yaw/速度等门控。启动后先让飞机固定静止至少 5 秒；桥只能在
-`connected=true`、`armed=false` 时锁定世界对齐，之后即使操作者用遥控器解锁，
-正常位姿流也会继续。数据回跳、突跳、非有限数、时间戳过期或雷达断流会立即停发，
-不会用最新时间戳重复上一帧。
+配置优先级：脚本安全默认值、私有 env、命令行。`--diagnostic-only` 强制禁发；
+`--publish-vision` 无法绕过门控。
 
-常用命令：
+### 7.2 会让整次启动退出的条件
 
-```bash
-# 打印配置，不启动硬件
-bash shfile/start_airy_px4.sh --dry-run
+无论是否请求视觉发布，以下基础条件失败都会终止启动并清理本会话：
 
-# 30 秒未解锁台架测试，结束后自动收集最终状态并清理进程
-bash shfile/start_airy_px4.sh --diagnostic-only --test-seconds 30
+- 配置格式、路径、依赖或 ROS 环境无效；
+- 有冲突活动会话、重复节点或 vision 输入已有其他发布者；
+- roscore 无法创建/复用；
+- MAVROS FCU 未在等待窗口内达到 `connected=true、armed=false`；
+- `/Odometry` 未在启动器规定的等待窗口内出现；
+- 已启用的 bridge/monitor 没有发布首条诊断；
+- 持续模式下由本会话启动的任一组件进程退出。
 
-# 查看一个已经运行的会话，不启动或停止任何组件
-bash shfile/start_airy_px4.sh --status-only
+持续模式检查组件是否仍存活，但监控器是只读的，不会反向关闭 bridge。真正的数据断流、
+FCU/timesync 丢失和跳变保护由 bridge 自身处理。
 
-# 查看停止目标，不发送信号
-bash shfile/stop_airy_px4.sh --dry-run
+### 7.3 只阻止视觉发布的门控
 
-# 停止本项目飞机定位链路
-bash shfile/stop_airy_px4.sh
+以下条件失败通常不会阻止诊断栈启动，而是把 `PUBLISH_EFFECTIVE` 保持为 `0`：
+
+- 未请求 `PUBLISH_VISION`，或指定 `--diagnostic-only`；
+- `MOUNT_CONFIRMED=0`；
+- 方向未确认，且既不是限时测试也没有高风险持续发布许可；
+- `START_BRIDGE=0` 或 `START_MONITOR=0`；
+- Airy UDP `rmem_max` 小于 `4194304`；
+- MAVROS vision 输入没有正确 subscriber；
+- autopilot 不是 PX4，或固件不匹配默认 1.13.x；
+- PX4 参数表无法同步；
+- `EKF2_AID_MASK` 不含 EV position `8`，含未获准 EV yaw `16`，或含被禁止的
+  EV rotation `64`/未实现 EV velocity `256`；
+- `EKF2_HGT_MODE!=3`、`SYS_MC_EST_GROUP!=2`；
+- `EKF2_EV_POS_X/Y/Z` 任一非零或无法读取。
+
+`--test-seconds N` 允许 `DIRECTION_TEST_CONFIRMED=0` 时做限时真实发布，但不会绕过
+publish 请求、安装确认、UDP、subscriber、PX4 参数、bridge/monitor 等其他门。
+`EKF2_EV_DELAY` 只记录，不会由脚本修改。全部 PX4 检查是当前 1.13.x 方案，不应直接
+套到其他版本。
+
+### 7.4 限时测试验收
+
+只有使用 `--test-seconds` 时，倒计时结束才会综合断言：组件存活、飞控始终未解锁、
+FAST-LIO 输入频率/新鲜度、视觉实际输出、bridge/monitor 诊断、timesync、PX4 通用
+solution flags 和 local pose 连续性等，并写 `final_status.txt`。监控仍会保留
+`EV_FUSION_UNVERIFIED`，限时测试通过也不等于 EV 融合或飞行验收通过。
+
+### 7.5 运行目录
+
+默认目录：
+
+```text
+runtime/airy_px4/<会话>/
+  session.meta
+  processes.tsv
+  logs/ros/             # roslaunch 日志目录
+  logs/ros_home/        # 本会话 ROS_HOME
+  logs/roscore.log      # 仅本会话创建 roscore 时
+  logs/mavros.log       # 仅 START_MAVROS=1 时
+  logs/fastlio.log      # 仅 START_FASTLIO=1 时
+  logs/bridge.log       # 仅 START_BRIDGE=1 时
+  logs/monitor.log      # 仅 START_MONITOR=1 时
+  final_status.txt       # 限时测试结束后
+runtime/airy_px4/active_<UAV>.session   # 活动期间的会话指针
+runtime/airy_px4_locks/                 # 固定在项目内的并发锁
 ```
 
-综合脚本绝不执行以下操作：自动 `set_mode`、自动 `arming`、自动起飞、写 PX4
-参数、发送 OFFBOARD setpoint 或绕过 Preflight 检查。Position 模式切换和解锁
-始终由遥控器与操作者完成。
+`SESSION_ROOT` 可设为绝对路径；相对路径会按项目根解析。活动指针随它移动，但锁目录固定
+在项目 `runtime/airy_px4_locks/`。历史会话不会由停止器删除。
 
-### 状态含义与飞行前验收
+## 8. 位姿桥
 
-读取总体状态：
+`fastlio_to_mavros.py` 通常只由综合启动器调用。主要输入：
 
-```bash
-rostopic echo -n 1 /airy_px4/monitor/diagnostics
-rostopic echo -n 1 /airy_px4/bridge/diagnostics
-```
+- `/Odometry`；
+- `/rslidar_imu_data`；
+- `/<UAV>/mavros/imu/data`；
+- `/<UAV>/mavros/state`；
+- `/<UAV>/mavros/timesync_status`。
+
+输出：
+
+- `/<UAV>/mavros/vision_pose/pose`；
+- `/airy_px4/bridge/diagnostics`。
+
+它执行 5 秒左右的未解锁静止对齐，应用 `I -> B` 旋转和杆臂，保留 FAST-LIO 的原始
+测量时间并按原生约 10 Hz 发布。它不插值、不重复旧位姿、不发送速度或协方差。
+它也不读取 FAST-LIO 特征数、几何退化指标或源 covariance；只要 `/Odometry` 仍满足
+时间、频率和跳变门，遮挡/退化场景不保证自动停发。
+
+输入 `/Odometry` 必须是 `header.frame_id=camera_init`、
+`child_frame_id=body`。桥同时求出 FAST-LIO 世界 `W ->` 本地 ENU 的静止对齐，输出
+PoseStamped 使用 `header.frame_id=odom`，但桥本身不广播该 TF。
+
+常见 bridge 状态：
 
 | 状态 | 含义 |
 | --- | --- |
-| `BLOCKED_BY_STARTUP_GATE` | 安全默认值或 PX4 参数阻止了视觉发布 |
-| `WAITING_STATIONARY_ALIGNMENT` | 等待未解锁、静止和双 IMU 重力一致性检查 |
-| `PUBLISHING_NATIVE_RATE` | 桥正按 FAST-LIO 原始时间戳/原始频率发布 |
-| `BENCH_ONLY_POSE_RATE_TOO_LOW` | 位姿链路已通，但频率低于飞行验收门槛 |
-| `PX4_NOT_ACCEPTING_VISION` | 桥已发数据，但 PX4 estimator/local pose 尚未证明接收融合 |
-| `POSITION_DATA_READY` | 自动技术门控与人工方向确认均通过；仍不代表允许直接起飞 |
-| `FAULT_LATCHED` | 发生断流、回跳或突跳，已停发；排障后必须重启桥/综合脚本 |
+| `BLOCKED_BY_STARTUP_GATE` | 启动器明确禁止视觉发布 |
+| `MOUNT_UNCONFIRMED` | 安装外参未确认 |
+| `WAITING_FASTLIO` | 等待有效里程计 |
+| `FASTLIO_STALE` | 最近源数据过期 |
+| `FCU_DISCONNECTED` | 对齐前没有新鲜、已连接的 FCU state |
+| `ARMED_BEFORE_ALIGNMENT` | 静止对齐完成前飞控已解锁 |
+| `WAITING_STATIONARY_ALIGNMENT` | 等待未解锁静止窗口和双 IMU一致性 |
+| `MAVROS_NOT_SUBSCRIBED` | vision 输出没有 MAVROS subscriber |
+| `PUBLISHING_NATIVE_RATE` | 正按原始测量时间和频率发布 |
+| `FAULT_LATCHED` | 严重故障已锁存，处理原因后重启会话 |
 
-当前 FAST-LIO 受 10 Hz 激光扫描更新限制，而 PX4 外部视觉通常建议 30～50 Hz。
-脚本把 30 Hz 作为飞行验收门槛，不会把旧位姿换成新时间戳重复发布。要消除这个
-阻塞，需要增加真实的高频 IMU 状态传播与正确的回溯校正，而不是简单上采样。
+完成对齐后，跳变、源时间断档、receipt stall、timesync/FCU 丢失等严重故障会锁存；
+对齐前的异常通常拒绝样本或重新等待。单帧非有限或过期消息可能只被拒绝，后续有效帧
+可以恢复。诊断时查看实际键 `latched_fault` 和 `last_rejection`。
 
-拆桨并固定飞机后至少完成：静置漂移、前/左/上与转向符号、MAVROS local pose
-一致性、雷达断流立即停发、PX4 失位降级、三次冷启动重复测试。方向和失效测试通过
-后才可设置 `DIRECTION_TEST_CONFIRMED=1`。飞行前还要检查电池状态、桨叶区域、遥控
-失控保护和现场安全条件。
+离线数学自测：
 
-雷达网络、端口、逐点时间戳与外参注意事项见
-`environment/README_AIRY.md`。
+```bash
+source shfile/setup_fastlio2_Airy.bash
+python3 shfile/fastlio_to_mavros.py --self-test
+```
 
-## Livox（原方案，继续保留）
+## 9. 只读监控器
 
-Livox 源码和脚本没有删除。需要恢复 Livox 雷达时使用：
+`monitor_airy_px4.py` 聚合 bridge、FAST-LIO、MAVROS state、local pose、timesync、
+estimator status 和 PX4 statustext，输出：
+
+```text
+/airy_px4/monitor/diagnostics
+```
+
+重点状态：
+
+- `DIAGNOSTIC_GATE_BLOCKED`：主动诊断禁发，属预期；
+- `BRIDGE_WAITING`：桥仍在初始化/对齐；
+- `VISION_STREAM_NOT_READY`：请求发布但视觉流不满足要求；
+- `PX4_LOCAL_POSE_NOT_CONTINUOUS`：PX4 下行本地位姿不连续；
+- `BENCH_ONLY_POSE_RATE_TOO_LOW`：链路可跑，但真实位姿低于项目飞行门槛；
+- `DIRECTION_TEST_NOT_CONFIRMED`：拆桨方向测试尚未确认；
+- `EV_FUSION_UNVERIFIED`：现有 ROS 信息不能证明 EKF2 已融合 EV。
+
+监控器故意不输出 `POSITION_DATA_READY`。`ESTIMATOR_STATUS` solution flags 不包含唯一
+数据来源信息；进入 POSCTL 也只证明 Commander 接受过模式。融合证据仍需 ULog/uORB。
+
+## 10. 双 IMU 安装旋转标定
+
+标定器只求 Airy IMU `I ->` 飞机 FLU `B` 的旋转，不求：
+
+- Airy LiDAR `L -> I` 内部外参；
+- Airy IMU 到飞机重心的杆臂；
+- 时间延迟；
+- PX4 参数。
+
+拆桨、未解锁，终端 1：
+
+```bash
+bash shfile/start_airy_px4.sh --diagnostic-only
+```
+
+终端 2：
+
+```bash
+source shfile/setup_fastlio2_Airy.bash
+python3 shfile/calibrate_airy_body.py
+```
+
+默认流程为 3 秒准备、6 秒静止偏置、45 秒三轴动态采集，最大配对时间差 12 ms。按提示
+围绕 X/Y/Z 三轴缓慢、充分、双向转动。工具只读，不写 env、不切模式、不解锁；失败时
+不会输出可直接采用的外参。
+
+常用参数：
+
+```text
+--sensor-topic TOPIC
+--fcu-topic TOPIC
+--state-topic TOPIC
+--expected-fcu-frame FRAME
+--confirm-props-removed
+--state-timeout S
+--start-delay S
+--bias-seconds S
+--capture-seconds S
+--max-pair-dt-ms MS
+--self-test
+```
+
+质量门参数及默认值：
+
+| 选项 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `--min-stationary-pairs` | `150` | 最少静止配对样本 |
+| `--min-pairs` | `300` | 鲁棒筛选后最少动态配对 |
+| `--max-stationary-rate` | `0.06` | 静止去偏后 P95 最大角速度，rad/s |
+| `--min-dynamic-rate` / `--max-dynamic-rate` | `0.18 / 1.80` | 有效动态角速度范围，rad/s |
+| `--min-rate-ratio` / `--max-rate-ratio` | `0.65 / 1.45` | FCU/Airy 角速度模长比 |
+| `--outlier-angle-deg` | `18` | 鲁棒筛选最大角方向残差 |
+| `--outlier-rate-error` | `0.25` | 最大角速度向量误差，rad/s |
+| `--min-retained-fraction` | `0.65` | 最小保留样本比例 |
+| `--min-excitation-ratio` | `0.10` | 三轴方向矩阵最小/最大特征值比 |
+| `--max-rms-angle-deg` / `--max-p95-angle-deg` | `6 / 10` | 拟合角残差门槛 |
+| `--max-rms-rate-error` | `0.12` | 角速度向量 RMS 上限，rad/s |
+| `--min-gravity-norm` / `--max-gravity-norm` | `7.0 / 12.5` | 静止重力模长范围，m/s² |
+| `--max-gravity-angle-deg` | `8` | 映射后双 IMU 重力夹角上限 |
+
+以 `python3 shfile/calibrate_airy_body.py --help` 为完整、权威接口。除非有标定数据依据，
+不要为了得到 PASS 而放宽质量门。
+
+非交互运行只有在人工确认拆桨后才可使用 `--confirm-props-removed`。输出四元数顺序为
+`[x,y,z,w]`，`q` 与 `-q` 等价。填写 env、量取杆臂、完成平移/三轴方向/失效测试后，
+才可确认安装。
+
+离线合成数据自测：
+
+```bash
+source shfile/setup_fastlio2_Airy.bash
+python3 shfile/calibrate_airy_body.py --self-test
+```
+
+## 11. 停止器
+
+```text
+bash shfile/stop_airy_px4.sh [--config FILE] [--dry-run]
+```
+
+停止器优先查找与本机配置、当前 UID 和 boot ID 匹配的活动会话，并以 PID、进程启动
+时间和 PGID 校验归属。它会停止会话创建的 Airy/FAST-LIO、bridge、monitor、MAVROS，
+以及确由本会话创建的 roscore；复用的已有 ROS master 保留。
+
+它不会向 PX4 发送模式、解锁、参数或控制命令。重复执行时“没有相关进程”视为成功，
+不会删除历史日志。
+
+若会话元数据丢失，脚本才按项目绝对路径和 MAVROS namespace 对当前用户做保守 fallback
+匹配。fallback 会保留无法证明归属的旧 roscore，但可能停止当前用户从本项目 build
+路径手工启动的 Airy/FAST-LIO，以及同 namespace 的 MAVROS。手工并行运行多个同名栈
+时先使用：
+
+```bash
+bash shfile/stop_airy_px4.sh --dry-run
+```
+
+## 12. Livox 保留链路
+
+Livox 使用独立脚本：
 
 ```bash
 bash shfile/install_fastlio2_Livox.sh
 source shfile/setup_fastlio2_Livox.bash
 ```
 
-两套构建使用不同目录，Airy 构建会显式关闭
-`livox_ros_driver/CustomMsg` 依赖，Livox 构建默认仍启用该支持。
+它依赖 `environment/Livox-SDK/` 和 `environment/ws_livox/`，不属于 Airy + PX4 综合
+启动流程。Airy 主线的权威入口始终是带 `_Airy` 后缀的安装和环境脚本；不要交叉加载
+Airy/Livox overlay 或把两套构建目录混用。
 
-## 安装模式与常用选项
+## 13. 维护者检查
 
-```bash
-# 默认：安装依赖，支持在线 UDP 和驱动直接读取离线 PCAP
-bash shfile/install_fastlio2_Airy.sh --jobs 2
-
-# 仅使用在线 Airy，不安装/链接 libpcap
-bash shfile/install_fastlio2_Airy.sh --online-only --jobs 2
-
-# 依赖已经就绪，只检查依赖并增量编译，全程不调用 sudo/apt
-bash shfile/install_fastlio2_Airy.sh --build-only --online-only --jobs 2
-
-# 显式将一个已有 NetworkManager 有线连接配置为 Airy 专网
-bash shfile/install_fastlio2_Airy.sh --jobs 2 \
-  --configure-network '有线连接 1' \
-  --host-cidr 192.168.1.102/24 \
-  --lidar-ip 192.168.1.200
-
-# APT 索引已更新时
-bash shfile/install_fastlio2_Airy.sh --skip-apt-update
-
-# 安装 RViz 等完整 ROS 桌面组件
-bash shfile/install_fastlio2_Airy.sh --desktop-full
-```
-
-`--online-only` 只禁用 rslidar_sdk 直接解析 PCAP 文件，不影响在线点云/IMU，也
-不影响 ROS bag。`--build-only` 为保证零 sudo，不能与 `--configure-network`
-同时使用。网络配置是显式选择项：它设置静态地址、清空网关、启用
-`ipv4.never-default` 并禁用 IPv6，不会在默认安装时自动修改网卡。
-
-完整参数说明：
+修改本目录后至少运行：
 
 ```bash
-bash shfile/install_fastlio2_Airy.sh --help
+for file in shfile/*.sh shfile/*.bash; do
+  bash -n "$file"
+done
+python3 -m py_compile shfile/*.py
+source shfile/setup_fastlio2_Airy.bash
+python3 shfile/fastlio_to_mavros.py --self-test
+python3 shfile/calibrate_airy_body.py --self-test
+git diff --check
 ```
 
-脚本默认要求 Ubuntu 20.04。`--allow-unsupported-os` 只用于已经自行配置好
-ROS Noetic 的非标准系统，不保证其 APT 软件源存在所需二进制包。
+涉及硬件或门控逻辑时，再按以下顺序回归：
+
+1. 驱动话题自检；
+2. 固定 rosbag 回放；
+3. `--diagnostic-only`；
+4. 拆桨、未解锁限时发布；
+5. ULog/uORB 融合与失效测试；
+6. 三次冷启动重复性。
+
+任何“让脚本更容易发布”的修改都必须保留未解锁检查、安装确认、时间/断流保护、PX4
+版本化参数门和日志可追溯性。

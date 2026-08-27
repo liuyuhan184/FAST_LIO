@@ -9,6 +9,7 @@ readonly PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly AIRY_SETUP="${SCRIPT_DIR}/setup_fastlio2_Airy.bash"
 readonly BRIDGE_SCRIPT="${SCRIPT_DIR}/fastlio_to_mavros.py"
 readonly MONITOR_SCRIPT="${SCRIPT_DIR}/monitor_airy_px4.py"
+readonly MIN_AIRY_UDP_RMEM_MAX=4194304
 
 # Safe defaults.  A local shfile/airy_px4.env may override them.
 UAV_NAME="${UAV_NAME:-liu}"
@@ -29,6 +30,7 @@ START_MONITOR="${START_MONITOR:-1}"
 PUBLISH_VISION="${PUBLISH_VISION:-0}"
 MOUNT_CONFIRMED="${MOUNT_CONFIRMED:-0}"
 DIRECTION_TEST_CONFIRMED="${DIRECTION_TEST_CONFIRMED:-0}"
+ALLOW_APPROXIMATE_DIRECTION_PUBLISH="${ALLOW_APPROXIMATE_DIRECTION_PUBLISH:-0}"
 ALLOW_VISION_YAW_FUSION="${ALLOW_VISION_YAW_FUSION:-0}"
 SENSOR_TO_BODY_Q_X="${SENSOR_TO_BODY_Q_X:-0.0}"
 SENSOR_TO_BODY_Q_Y="${SENSOR_TO_BODY_Q_Y:-0.0}"
@@ -41,7 +43,10 @@ SENSOR_POSITION_IN_BODY_Z="${SENSOR_POSITION_IN_BODY_Z:-0.0}"
 ALIGN_STABLE_SECONDS="${ALIGN_STABLE_SECONDS:-5.0}"
 MIN_FASTLIO_RATE_HZ="${MIN_FASTLIO_RATE_HZ:-8.0}"
 FLIGHT_MIN_POSE_RATE_HZ="${FLIGHT_MIN_POSE_RATE_HZ:-30.0}"
+MIN_LOCAL_POSE_RATE_HZ="${MIN_LOCAL_POSE_RATE_HZ:-2.0}"
 MAX_SOURCE_AGE_S="${MAX_SOURCE_AGE_S:-0.5}"
+MAX_SOURCE_GAP_S="${MAX_SOURCE_GAP_S:-0.30}"
+MAX_RECEIPT_STALL_S="${MAX_RECEIPT_STALL_S:-0.50}"
 MAX_POSITION_JUMP_M="${MAX_POSITION_JUMP_M:-1.0}"
 MAX_ORIENTATION_JUMP_DEG="${MAX_ORIENTATION_JUMP_DEG:-45.0}"
 MAX_GRAVITY_MISMATCH_DEG="${MAX_GRAVITY_MISMATCH_DEG:-10.0}"
@@ -49,10 +54,12 @@ SESSION_ROOT="${SESSION_ROOT:-${PROJECT_ROOT}/runtime/airy_px4}"
 
 CONFIG_FILE="${AIRY_PX4_CONFIG:-${SCRIPT_DIR}/airy_px4.env}"
 CONFIG_EXPLICIT=0
+CONFIG_FILE_LOADED=0
 DIAGNOSTIC_ONLY=0
 DRY_RUN=0
 TEST_SECONDS=0
 PRINT_STATUS_ONLY=0
+UDP_RMEM_MAX="unknown"
 
 ORIGINAL_ARGS=("$@")
 for ((argument_index = 0; argument_index < ${#ORIGINAL_ARGS[@]}; argument_index++)); do
@@ -69,6 +76,7 @@ done
 if [[ -f "${CONFIG_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONFIG_FILE}"
+  CONFIG_FILE_LOADED=1
 elif [[ "${CONFIG_EXPLICIT}" == "1" ]]; then
   printf '[ERROR] 找不到配置文件：%s\n' "${CONFIG_FILE}" >&2
   exit 2
@@ -96,6 +104,9 @@ usage() {
 
 完成安装外参标定、PX4 参数配置和拆桨方向测试后，才可在本机配置中设置
 PUBLISH_VISION=1。Position 模式与解锁始终由遥控器完成。
+仅做拆桨 Position 接受性验证时，优先使用 --publish-vision --test-seconds N，
+并保持 ALLOW_APPROXIMATE_DIRECTION_PUBLISH=0。把该变量设为 1 会允许方向未确认时
+持续发布，属于额外高风险豁免，且不会把方向测试状态伪装为已完成。
 
 停止本项目相关进程：
   bash shfile/stop_airy_px4.sh
@@ -148,13 +159,15 @@ require_range() {
 }
 
 for switch_name in START_ROSCORE START_MAVROS START_FASTLIO START_BRIDGE START_MONITOR \
-  PUBLISH_VISION MOUNT_CONFIRMED DIRECTION_TEST_CONFIRMED ALLOW_VISION_YAW_FUSION; do
+  PUBLISH_VISION MOUNT_CONFIRMED DIRECTION_TEST_CONFIRMED \
+  ALLOW_APPROXIMATE_DIRECTION_PUBLISH ALLOW_VISION_YAW_FUSION; do
   validate_bool "${switch_name}" "${!switch_name}"
 done
 for number_name in SENSOR_TO_BODY_Q_X SENSOR_TO_BODY_Q_Y SENSOR_TO_BODY_Q_Z \
   SENSOR_TO_BODY_Q_W SENSOR_POSITION_IN_BODY_X SENSOR_POSITION_IN_BODY_Y \
   SENSOR_POSITION_IN_BODY_Z ALIGN_STABLE_SECONDS MIN_FASTLIO_RATE_HZ \
-  FLIGHT_MIN_POSE_RATE_HZ MAX_SOURCE_AGE_S MAX_POSITION_JUMP_M \
+  FLIGHT_MIN_POSE_RATE_HZ MIN_LOCAL_POSE_RATE_HZ MAX_SOURCE_AGE_S MAX_SOURCE_GAP_S \
+  MAX_RECEIPT_STALL_S MAX_POSITION_JUMP_M \
   MAX_ORIENTATION_JUMP_DEG MAX_GRAVITY_MISMATCH_DEG; do
   # Transform components may be negative.
   if [[ "${number_name}" == SENSOR_* ]]; then
@@ -173,7 +186,10 @@ done
 require_range ALIGN_STABLE_SECONDS "${ALIGN_STABLE_SECONDS}" 5 60
 require_range MIN_FASTLIO_RATE_HZ "${MIN_FASTLIO_RATE_HZ}" 8 100
 require_range FLIGHT_MIN_POSE_RATE_HZ "${FLIGHT_MIN_POSE_RATE_HZ}" 30 100
+require_range MIN_LOCAL_POSE_RATE_HZ "${MIN_LOCAL_POSE_RATE_HZ}" 1 20
 require_range MAX_SOURCE_AGE_S "${MAX_SOURCE_AGE_S}" 0.05 0.5
+require_range MAX_SOURCE_GAP_S "${MAX_SOURCE_GAP_S}" 0.3 1.0
+require_range MAX_RECEIPT_STALL_S "${MAX_RECEIPT_STALL_S}" 0.5 2.0
 require_range MAX_POSITION_JUMP_M "${MAX_POSITION_JUMP_M}" 0.05 5
 require_range MAX_ORIENTATION_JUMP_DEG "${MAX_ORIENTATION_JUMP_DEG}" 1 90
 require_range MAX_GRAVITY_MISMATCH_DEG "${MAX_GRAVITY_MISMATCH_DEG}" 1 15
@@ -706,7 +722,11 @@ diagnostic_value() {
 assert_diagnostic_test() {
   local failures=0 snapshot bridge_status monitor_status
   local connected armed bridge_message input_rate input_age output_rate last_rejection
-  local monitor_message timesync_ok estimator_ready local_pose_fresh vision_fresh bridge_ok
+  local monitor_message timesync_ok solution_flags_ok local_pose_continuous
+  local vision_fresh bridge_ok bridge_state bridge_gate_blocked recent_px4_fault
+  local ev_fusion_verified position_mode_acceptance_verified
+  local position_mode_acceptance_unverified position_data_ready
+  local blocking_reasons required_reason
   snapshot="$(state_snapshot)"
   connected="$(awk '/^connected:/ {print $2; exit}' <<<"${snapshot}")"
   armed="$(awk '/^armed:/ {print $2; exit}' <<<"${snapshot}")"
@@ -764,24 +784,68 @@ assert_diagnostic_test() {
   monitor_status="$(timeout 3s rostopic echo -n 1 /airy_px4/monitor/diagnostics 2>/dev/null || true)"
   monitor_message="$(awk '/^[[:space:]]*message:/ {gsub(/"/, "", $2); print $2; exit}' <<<"${monitor_status}")"
   timesync_ok="$(diagnostic_value "${monitor_status}" timesync_ok)"
-  estimator_ready="$(diagnostic_value "${monitor_status}" px4_estimator_ready)"
-  local_pose_fresh="$(diagnostic_value "${monitor_status}" px4_local_pose_fresh)"
+  solution_flags_ok="$(diagnostic_value "${monitor_status}" px4_solution_flags_ok)"
+  local_pose_continuous="$(diagnostic_value "${monitor_status}" px4_local_pose_continuous)"
   vision_fresh="$(diagnostic_value "${monitor_status}" vision_fresh)"
   bridge_ok="$(diagnostic_value "${monitor_status}" bridge_ok)"
-  if [[ "${PUBLISH_EFFECTIVE}" == "1" ]]; then
-    case "${monitor_message}" in
-      BENCH_ONLY_POSE_RATE_TOO_LOW|DIRECTION_TEST_NOT_CONFIRMED|POSITION_DATA_READY) ;;
+  bridge_state="$(diagnostic_value "${monitor_status}" bridge_state)"
+  bridge_gate_blocked="$(diagnostic_value "${monitor_status}" bridge_gate_blocked)"
+  recent_px4_fault="$(diagnostic_value "${monitor_status}" recent_px4_fault)"
+  ev_fusion_verified="$(diagnostic_value "${monitor_status}" ev_fusion_verified)"
+  position_mode_acceptance_verified="$(diagnostic_value "${monitor_status}" position_mode_acceptance_verified)"
+  position_mode_acceptance_unverified="$(diagnostic_value "${monitor_status}" position_mode_acceptance_unverified)"
+  position_data_ready="$(diagnostic_value "${monitor_status}" position_data_ready)"
+  blocking_reasons="$(diagnostic_value "${monitor_status}" blocking_reasons)"
+
+  [[ -n "${monitor_message}" ]] || {
+    warn "验收失败：没有读到监控总体状态。"
+    failures=$((failures + 1))
+  }
+  [[ "${position_data_ready}" == "False" ]] || {
+    warn "验收失败：监控在缺少直接融合/模式接受证据时错误声明 Position 数据就绪。"
+    failures=$((failures + 1))
+  }
+  [[ "${ev_fusion_verified}" == "False" ]] || {
+    warn "验收失败：当前监控不具备外部视觉融合证明，却返回 ev_fusion_verified=${ev_fusion_verified:-missing}。"
+    failures=$((failures + 1))
+  }
+  case "${position_mode_acceptance_verified}/${position_mode_acceptance_unverified}" in
+    True/False|False/True) ;;
+    *)
+      warn "验收失败：Position 接受状态自相矛盾：verified=${position_mode_acceptance_verified:-missing} unverified=${position_mode_acceptance_unverified:-missing}。"
+      failures=$((failures + 1))
+      ;;
+  esac
+  for required_reason in EV_FUSION_UNVERIFIED; do
+    case ",${blocking_reasons}," in
+      *",${required_reason},"*) ;;
       *)
-        warn "验收失败：发布台架总体状态 ${monitor_message:-missing}。"
+        warn "验收失败：监控 blocking_reasons 缺少 ${required_reason}。"
         failures=$((failures + 1))
         ;;
     esac
-    [[ "${estimator_ready}" == "True" ]] || {
-      warn "验收失败：PX4 estimator 尚未建立所需位置/速度状态。"
+  done
+  if [[ "${position_mode_acceptance_verified}" != "True" ]]; then
+    case ",${blocking_reasons}," in
+      *",POSITION_MODE_ACCEPTANCE_UNVERIFIED,"*) ;;
+      *)
+        warn "验收失败：尚未观察到 POSCTL 时，监控没有保留 Position 接受未验证原因。"
+        failures=$((failures + 1))
+        ;;
+    esac
+  fi
+  [[ "${recent_px4_fault}" == "none" ]] || {
+    warn "验收失败：PX4 最近报告故障：${recent_px4_fault:-missing}。"
+    failures=$((failures + 1))
+  }
+
+  if [[ "${PUBLISH_EFFECTIVE}" == "1" ]]; then
+    [[ "${solution_flags_ok}" == "True" ]] || {
+      warn "验收失败：PX4 的通用位置/速度 solution flags 尚未满足保守台架判据；这不等价于视觉融合状态。"
       failures=$((failures + 1))
     }
-    [[ "${local_pose_fresh}" == "True" ]] || {
-      warn "验收失败：PX4 local_position/pose 没有持续输出。"
+    [[ "${local_pose_continuous}" == "True" ]] || {
+      warn "验收失败：PX4 local_position/pose 未达到持续频率和最小样本门。"
       failures=$((failures + 1))
     }
     [[ "${vision_fresh}" == "True" && "${bridge_ok}" == "True" ]] || {
@@ -789,10 +853,18 @@ assert_diagnostic_test() {
       failures=$((failures + 1))
     }
   else
-    [[ "${monitor_message}" == "DIAGNOSTIC_LINK_OK_NOT_POSITION_READY" ]] || {
-      warn "验收失败：总体诊断状态 ${monitor_message:-missing}。"
+    [[ "${bridge_state}" == "BLOCKED_BY_STARTUP_GATE" && \
+       "${bridge_gate_blocked}" == "True" ]] || {
+      warn "验收失败：监控未明确识别诊断安全门控：state=${bridge_state:-missing} gate=${bridge_gate_blocked:-missing}。"
       failures=$((failures + 1))
     }
+    case ",${blocking_reasons}," in
+      *",DIAGNOSTIC_GATE_BLOCKED,"*) ;;
+      *)
+        warn "验收失败：监控没有把诊断门控列入 blocking_reasons。"
+        failures=$((failures + 1))
+        ;;
+    esac
   fi
   [[ "${timesync_ok}" == "True" ]] || {
     warn "验收失败：MAVROS/PX4 时间同步不健康。"
@@ -823,7 +895,18 @@ if [[ "${DRY_RUN}" != "1" && "${PRINT_STATUS_ONLY}" != "1" && \
   exit "${lock_result}"
 fi
 
+if [[ "${CONFIG_FILE_LOADED}" != "1" && "${DRY_RUN}" != "1" && \
+      "${PRINT_STATUS_ONLY}" != "1" ]]; then
+  warn "未找到本机配置 ${CONFIG_FILE}；正在使用环境变量/脚本安全默认值。"
+  warn "当前 PUBLISH_VISION=${PUBLISH_VISION}、MOUNT_CONFIRMED=${MOUNT_CONFIRMED}；安全默认均为 0，任一未确认都会阻止视觉发布。"
+fi
+
 source_environment
+
+if [[ -r /proc/sys/net/core/rmem_max ]]; then
+  read -r UDP_RMEM_MAX </proc/sys/net/core/rmem_max || UDP_RMEM_MAX="unknown"
+  [[ "${UDP_RMEM_MAX}" =~ ^[0-9]+$ ]] || UDP_RMEM_MAX="unknown"
+fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   cat <<EOF
@@ -831,7 +914,8 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 [DRY-RUN] ROS master：${ROS_MASTER_URI}
 [DRY-RUN] MAVROS：namespace=/${UAV_NAME}, fcu_url=${FCU_URL}, gcs_url=${GCS_URL:-<disabled>}
 [DRY-RUN] 组件：roscore=${START_ROSCORE} mavros=${START_MAVROS} fastlio=${START_FASTLIO} bridge=${START_BRIDGE} monitor=${START_MONITOR}
-[DRY-RUN] 发布请求：${PUBLISH_VISION}；安装外参确认：${MOUNT_CONFIRMED}；方向测试确认：${DIRECTION_TEST_CONFIRMED}
+[DRY-RUN] 发布请求：${PUBLISH_VISION}；安装外参确认：${MOUNT_CONFIRMED}；方向测试确认：${DIRECTION_TEST_CONFIRMED}；近似方向发布：${ALLOW_APPROXIMATE_DIRECTION_PUBLISH}
+[DRY-RUN] UDP 接收上限：net.core.rmem_max=${UDP_RMEM_MAX}（要求 >=${MIN_AIRY_UDP_RMEM_MAX}）
 [DRY-RUN] 脚本不会切模式、解锁、写 PX4 参数或启动 PX4 SITL。
 EOF
   exit 0
@@ -865,6 +949,7 @@ launcher_start_ticks="$(process_start_ticks "$$")"
   printf 'launcher_pid=%s\n' "$$"
   printf 'launcher_start_ticks=%s\n' "${launcher_start_ticks}"
   printf 'ros_master_uri=%s\n' "${ROS_MASTER_URI}"
+  printf 'udp_rmem_max=%s\n' "${UDP_RMEM_MAX}"
   printf 'started_epoch=%s\n' "$(date +%s)"
 } >"${SESSION_META}"
 : >"${PROCESS_MANIFEST}"
@@ -916,8 +1001,19 @@ fi
 [[ "${MOUNT_CONFIRMED}" == "1" ]] || PUBLISH_BLOCK_REASONS+=("Airy IMU→base_link 安装外参未确认")
 [[ "${START_BRIDGE}" == "1" ]] || PUBLISH_BLOCK_REASONS+=("START_BRIDGE=0，禁止绕过本项目坐标与失效门控")
 [[ "${START_MONITOR}" == "1" ]] || PUBLISH_BLOCK_REASONS+=("START_MONITOR=0，禁止在无健康监控时发布")
-if [[ "${DIRECTION_TEST_CONFIRMED}" != "1" && "${TEST_SECONDS}" == "0" ]]; then
-  PUBLISH_BLOCK_REASONS+=("方向测试未确认；未解锁发布试验必须设置 --test-seconds")
+if [[ "${UDP_RMEM_MAX}" == "unknown" ]]; then
+  PUBLISH_BLOCK_REASONS+=("无法读取 net.core.rmem_max，不能确认 Airy UDP 接收缓冲")
+elif ((UDP_RMEM_MAX < MIN_AIRY_UDP_RMEM_MAX)); then
+  PUBLISH_BLOCK_REASONS+=("net.core.rmem_max=${UDP_RMEM_MAX} 小于 Airy 驱动要求 ${MIN_AIRY_UDP_RMEM_MAX}")
+else
+  info "Airy UDP 接收上限检查通过：net.core.rmem_max=${UDP_RMEM_MAX}。"
+fi
+if [[ "${DIRECTION_TEST_CONFIRMED}" != "1" && "${TEST_SECONDS}" == "0" && \
+      "${ALLOW_APPROXIMATE_DIRECTION_PUBLISH}" != "1" ]]; then
+  PUBLISH_BLOCK_REASONS+=("方向测试未确认；必须设置 --test-seconds，或在本机配置中显式允许近似方向发布")
+elif [[ "${DIRECTION_TEST_CONFIRMED}" != "1" && \
+        "${ALLOW_APPROXIMATE_DIRECTION_PUBLISH}" == "1" ]]; then
+  warn "已显式允许使用近似安装方向持续发布；仅用于拆桨 Position 接受性验证，不代表方向测试或飞行验收完成。"
 fi
 topic_has_subscriber "${VISION_TOPIC}" "${MAVROS_PREFIX}" || \
   PUBLISH_BLOCK_REASONS+=("${VISION_TOPIC} 没有 MAVROS vision_pose 插件订阅者")
@@ -999,11 +1095,16 @@ done
 if ((${#PUBLISH_BLOCK_REASONS[@]} == 0)); then
   PUBLISH_EFFECTIVE=1
   warn "外部视觉发布门控已通过；桥仍会等待未解锁静置对齐后才开始发布。"
+  if [[ "${DIRECTION_TEST_CONFIRMED}" != "1" ]]; then
+    warn "当前 DIRECTION_TEST_CONFIRMED=0：监控将继续报告方向未确认；不得据此判定可以装桨飞行。"
+  fi
 else
   warn "外部视觉发布被安全门控禁止："
   for reason in "${PUBLISH_BLOCK_REASONS[@]}"; do
     warn "  - ${reason}"
   done
+  warn "本次启动只验证链路，${VISION_TOPIC} 将保持 0 Hz。"
+  warn "PX4 不会因此建立外部本地位置；此状态下遥控器无法切入 Position 属于预期保护。"
 fi
 
 if [[ "${START_FASTLIO}" == "1" ]]; then
@@ -1039,6 +1140,8 @@ if [[ "${START_BRIDGE}" == "1" ]]; then
       "_stable_seconds:=${ALIGN_STABLE_SECONDS}" \
       "_min_source_rate_hz:=${MIN_FASTLIO_RATE_HZ}" \
       "_max_source_age_s:=${MAX_SOURCE_AGE_S}" \
+      "_max_source_gap_s:=${MAX_SOURCE_GAP_S}" \
+      "_max_receipt_stall_s:=${MAX_RECEIPT_STALL_S}" \
       "_max_position_jump_m:=${MAX_POSITION_JUMP_M}" \
       "_max_orientation_jump_deg:=${MAX_ORIENTATION_JUMP_DEG}" \
       "_max_gravity_mismatch_deg:=${MAX_GRAVITY_MISMATCH_DEG}"
@@ -1053,6 +1156,8 @@ if [[ "${START_MONITOR}" == "1" ]]; then
     env PYTHONUNBUFFERED=1 python3 "${MONITOR_SCRIPT}" \
       "_uav_name:=${UAV_NAME}" "_source_min_rate_hz:=${MIN_FASTLIO_RATE_HZ}" \
       "_flight_min_pose_rate_hz:=${FLIGHT_MIN_POSE_RATE_HZ}" \
+      "_local_pose_min_rate_hz:=${MIN_LOCAL_POSE_RATE_HZ}" \
+      "_max_data_age_s:=${MAX_SOURCE_AGE_S}" \
       "_direction_test_confirmed:=${direction_bool}"
   wait_for_topic_message /airy_px4/monitor/diagnostics 10 || die "监控器没有输出诊断。"
 fi
@@ -1065,6 +1170,8 @@ FCU 固件：PX4 ${FCU_VERSION_MAJOR}.${FCU_VERSION_MINOR}.${FCU_VERSION_PATCH}
 FAST-LIO：/Odometry 正常输出
 视觉发布请求：${PUBLISH_VISION}
 视觉实际发布门控：${PUBLISH_EFFECTIVE}
+近似方向发布许可：${ALLOW_APPROXIMATE_DIRECTION_PUBLISH}
+方向动态测试确认：${DIRECTION_TEST_CONFIRMED}
 EKF2_AID_MASK：${PX4_AID_MASK}
 EKF2_HGT_MODE：${PX4_HGT_MODE}
 活动估计器：SYS_MC_EST_GROUP=${PX4_ESTIMATOR_GROUP}
@@ -1072,8 +1179,15 @@ EKF2_HGT_MODE：${PX4_HGT_MODE}
 日志目录：${SESSION_DIR}
 
 本脚本没有切换模式、解锁、写参数或发送控制量。
-只有 /airy_px4/monitor/diagnostics 显示 POSITION_DATA_READY 时，才表示数据链
-满足脚本内的技术门控；最终拆桨方向/失效测试和遥控器操作仍由操作者负责。
+$(if [[ "${PUBLISH_EFFECTIVE}" == "0" ]]; then
+    printf '当前视觉输出被门控为 0 Hz：本次启动不能用于 Position 模式。\n'
+  fi)
+监控只把 ESTIMATOR_STATUS 解释为与来源无关的 PX4 solution flags，不会据此
+声称 Airy 外部视觉已经融合。若本会话实际观察到 POSCTL，会单独记录
+position_mode_acceptance_verified=True；ev_fusion_verified 仍保持 False，
+在缺少直接融合证据时绝不输出 POSITION_DATA_READY。
+必须另用 PX4 日志/uORB 融合证据和拆桨方向/失效测试完成验收；不得把本次
+监控结果作为切换 Position 或解锁飞行的依据。
 正常退出请按 Ctrl+C。
 =====================================================
 EOF
@@ -1090,7 +1204,7 @@ if [[ "${TEST_SECONDS}" != "0" ]]; then
   done
   print_status | tee "${SESSION_DIR}/final_status.txt"
   assert_diagnostic_test || die "未解锁台架测试未通过；请查看上方验收失败项和 ${SESSION_DIR}。"
-  info "未解锁台架测试通过；即将停止本脚本启动的组件。"
+  info "未解锁可观测数据链台架测试通过；EV 融合与 Position 模式接受仍未验证，不能据此进入飞行。"
   exit 0
 fi
 

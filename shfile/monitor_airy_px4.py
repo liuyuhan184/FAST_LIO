@@ -39,6 +39,10 @@ class Stream:
     def age(self, now_sec):
         return float("inf") if not self.receipts else now_sec - self.receipts[-1]
 
+    def count(self, now_sec):
+        self.trim(now_sec)
+        return len(self.receipts)
+
 
 class AiryPx4Monitor:
     def __init__(self):
@@ -82,6 +86,12 @@ class AiryPx4Monitor:
         self.max_timesync_offset_std_ms = float(
             rospy.get_param("~max_timesync_offset_std_ms", 5.0)
         )
+        self.local_pose_min_rate_hz = float(
+            rospy.get_param("~local_pose_min_rate_hz", 2.0)
+        )
+        self.min_local_pose_samples = max(
+            2, int(rospy.get_param("~min_local_pose_samples", 5))
+        )
         self.direction_test_confirmed = bool(
             rospy.get_param("~direction_test_confirmed", False)
         )
@@ -96,6 +106,7 @@ class AiryPx4Monitor:
         self.timesync_offsets_ns = deque(maxlen=50)
         self.recent_fcu_fault = ""
         self.recent_fcu_fault_time = None
+        self.position_mode_accepted_once = False
         self.last_summary = ""
 
         self.publisher = rospy.Publisher(
@@ -138,7 +149,10 @@ class AiryPx4Monitor:
         self._add(self.vision, message)
 
     def _state_cb(self, message):
-        self._add(self.state, message)
+        with self.lock:
+            self.state.add(message, rospy.Time.now())
+            if message.mode == "POSCTL":
+                self.position_mode_accepted_once = True
 
     def _estimator_cb(self, message):
         self._add(self.estimator, message)
@@ -203,6 +217,13 @@ class AiryPx4Monitor:
         now_sec = now.to_sec()
         source_rate = self.source.rate(now_sec)
         vision_rate = self.vision.rate(now_sec)
+        local_pose_rate = self.local_pose.rate(now_sec)
+        local_pose_samples = self.local_pose.count(now_sec)
+        source_age = self.source.age(now_sec)
+        vision_age = self.vision.age(now_sec)
+        local_pose_age = self.local_pose.age(now_sec)
+        estimator_age = self.estimator.age(now_sec)
+        bridge_age = self.bridge.age(now_sec)
         state = self.state.last_message
         estimator = self.estimator.last_message
         timesync = self.timesync.last_message
@@ -212,29 +233,49 @@ class AiryPx4Monitor:
             state and self.state.age(now_sec) < 2.0 and state.connected
         )
         source_fresh = (
-            self.source.age(now_sec) <= self.max_data_age_s
+            source_age <= self.max_data_age_s
             and source_rate >= self.source_min_rate_hz
         )
         vision_fresh = (
-            self.vision.age(now_sec) <= self.max_data_age_s
+            vision_age <= self.max_data_age_s
             and vision_rate >= self.source_min_rate_hz
             and self._pose_is_finite(self.vision.last_message)
         )
         flight_rate_ok = vision_rate >= self.flight_min_pose_rate_hz
-        local_pose_ok = (
-            self.local_pose.age(now_sec) <= self.max_data_age_s
+        local_pose_fresh = (
+            local_pose_age <= self.max_data_age_s
             and self._pose_is_finite(self.local_pose.last_message)
         )
+        local_pose_continuous = bool(
+            local_pose_fresh
+            and local_pose_rate >= self.local_pose_min_rate_hz
+            and local_pose_samples >= self.min_local_pose_samples
+        )
+        bridge_diagnostics_fresh = bool(bridge and bridge_age <= 2.0)
+        bridge_state = bridge.message if bridge else "missing"
         bridge_ok = bool(
-            bridge
+            bridge_diagnostics_fresh
             and bridge.level == DiagnosticStatus.OK
-            and bridge.message == "PUBLISHING_NATIVE_RATE"
-            and self.bridge.age(now_sec) <= 2.0
+            and bridge_state == "PUBLISHING_NATIVE_RATE"
+        )
+        bridge_gate_blocked = bool(
+            bridge_diagnostics_fresh and bridge_state == "BLOCKED_BY_STARTUP_GATE"
+        )
+        bridge_waiting = bool(
+            bridge_diagnostics_fresh
+            and bridge_state in ("WAITING_FASTLIO", "WAITING_STATIONARY_ALIGNMENT")
+        )
+        bridge_fault = bool(
+            bridge_diagnostics_fresh
+            and not bridge_ok
+            and not bridge_gate_blocked
+            and not bridge_waiting
         )
 
-        estimator_ok = False
-        if estimator is not None and self.estimator.age(now_sec) <= 2.0:
-            estimator_ok = bool(
+        estimator_fresh = bool(estimator is not None and estimator_age <= 2.0)
+        solution_flags_ok = False
+        if estimator_fresh:
+            solution_flags_ok = bool(
                 estimator.attitude_status_flag
                 and estimator.velocity_horiz_status_flag
                 and estimator.velocity_vert_status_flag
@@ -269,53 +310,186 @@ class AiryPx4Monitor:
             self.recent_fcu_fault_time
             and (now - self.recent_fcu_fault_time).to_sec() < 30.0
         )
-        technical_ready = bool(
+
+        # MAVLink ESTIMATOR_STATUS exposes source-agnostic solution-validity
+        # flags and does not prove that external vision is fused.  PX4's
+        # reported POSCTL mode does directly prove that Commander accepted
+        # Position at least once during this monitor session, so record that
+        # narrower fact without promoting it to EV fusion evidence.
+        ev_fusion_verified = False
+        position_mode_acceptance_verified = bool(self.position_mode_accepted_once)
+        position_mode_acceptance_unverified = not position_mode_acceptance_verified
+        observable_pipeline_ok = bool(
             connected
             and source_fresh
             and vision_fresh
             and flight_rate_ok
-            and local_pose_ok
+            and local_pose_continuous
             and bridge_ok
-            and estimator_ok
+            and solution_flags_ok
             and timesync_ok
             and not fcu_fault_active
         )
-        position_ready = technical_ready and self.direction_test_confirmed
+        position_ready = bool(
+            observable_pipeline_ok
+            and self.direction_test_confirmed
+            and ev_fusion_verified
+            and not position_mode_acceptance_unverified
+        )
 
-        if position_ready:
-            level, summary = DiagnosticStatus.OK, "POSITION_DATA_READY"
-        elif technical_ready:
-            level, summary = DiagnosticStatus.WARN, "DIRECTION_TEST_NOT_CONFIRMED"
-        elif vision_fresh and bridge_ok and (not estimator_ok or not local_pose_ok):
-            level, summary = DiagnosticStatus.ERROR, "PX4_NOT_ACCEPTING_VISION"
-        elif vision_fresh and bridge_ok and not timesync_ok:
-            level, summary = DiagnosticStatus.ERROR, "TIMESYNC_UNHEALTHY"
-        elif vision_fresh and bridge_ok and fcu_fault_active:
+        blocking_reasons = []
+
+        def block(reason):
+            if reason not in blocking_reasons:
+                blocking_reasons.append(reason)
+
+        if not connected:
+            block("FCU_DISCONNECTED")
+        if not source_fresh:
+            block("FASTLIO_NOT_READY")
+        if fcu_fault_active:
+            block("PX4_STATUS_FAULT")
+        if not timesync_ok:
+            block("TIMESYNC_UNHEALTHY")
+
+        if bridge is None:
+            block("BRIDGE_DIAGNOSTICS_MISSING")
+        elif not bridge_diagnostics_fresh:
+            block("BRIDGE_DIAGNOSTICS_STALE")
+        elif bridge_gate_blocked:
+            block("DIAGNOSTIC_GATE_BLOCKED")
+        elif bridge_waiting:
+            block("BRIDGE_WAITING_{}".format(bridge_state))
+        elif bridge_fault:
+            block("BRIDGE_FAULT_{}".format(bridge_state))
+
+        # Downstream failures are meaningful once the bridge says it is
+        # publishing.  Add all of them instead of choosing one mutually
+        # exclusive cause, so a 10 Hz warning cannot hide an EKF/local-pose
+        # failure.
+        if bridge_ok:
+            if not vision_fresh:
+                block("VISION_STREAM_NOT_READY")
+            if not flight_rate_ok:
+                block("POSE_RATE_BELOW_FLIGHT_MIN")
+            if not local_pose_continuous:
+                block("PX4_LOCAL_POSE_NOT_CONTINUOUS")
+            if not solution_flags_ok:
+                block("PX4_SOLUTION_FLAGS_NOT_OK")
+
+        if not self.direction_test_confirmed:
+            block("DIRECTION_TEST_NOT_CONFIRMED")
+        if not ev_fusion_verified:
+            block("EV_FUSION_UNVERIFIED")
+        if position_mode_acceptance_unverified:
+            block("POSITION_MODE_ACCEPTANCE_UNVERIFIED")
+
+        if bridge is None:
+            level, summary = DiagnosticStatus.ERROR, "BRIDGE_DIAGNOSTICS_MISSING"
+        elif not bridge_diagnostics_fresh:
+            level, summary = DiagnosticStatus.ERROR, "BRIDGE_DIAGNOSTICS_STALE"
+        elif bridge_fault:
+            level, summary = DiagnosticStatus.ERROR, "BRIDGE_FAULT"
+        elif not connected:
+            level, summary = DiagnosticStatus.ERROR, "FCU_DISCONNECTED"
+        elif not source_fresh:
+            level, summary = DiagnosticStatus.ERROR, "FASTLIO_NOT_READY"
+        elif fcu_fault_active:
             level, summary = DiagnosticStatus.ERROR, "PX4_STATUS_FAULT"
-        elif vision_fresh and bridge_ok and not flight_rate_ok:
+        elif not timesync_ok:
+            level, summary = DiagnosticStatus.ERROR, "TIMESYNC_UNHEALTHY"
+        elif bridge_gate_blocked:
+            level, summary = DiagnosticStatus.WARN, "DIAGNOSTIC_GATE_BLOCKED"
+        elif bridge_waiting:
+            level, summary = DiagnosticStatus.WARN, "BRIDGE_WAITING"
+        elif not vision_fresh:
+            level, summary = DiagnosticStatus.ERROR, "VISION_STREAM_NOT_READY"
+        elif not solution_flags_ok:
+            level, summary = DiagnosticStatus.ERROR, "PX4_SOLUTION_FLAGS_NOT_OK"
+        elif not local_pose_continuous:
+            level, summary = DiagnosticStatus.ERROR, "PX4_LOCAL_POSE_NOT_CONTINUOUS"
+        elif not flight_rate_ok:
             level, summary = DiagnosticStatus.WARN, "BENCH_ONLY_POSE_RATE_TOO_LOW"
-        elif connected and source_fresh:
-            level, summary = DiagnosticStatus.WARN, "DIAGNOSTIC_LINK_OK_NOT_POSITION_READY"
+        elif not self.direction_test_confirmed:
+            level, summary = DiagnosticStatus.WARN, "DIRECTION_TEST_NOT_CONFIRMED"
         else:
-            level, summary = DiagnosticStatus.ERROR, "NOT_READY"
+            level, summary = DiagnosticStatus.WARN, "EV_FUSION_UNVERIFIED"
 
         values = {
             "position_data_ready": position_ready,
+            "observable_pipeline_ok": observable_pipeline_ok,
+            "ev_fusion_verified": ev_fusion_verified,
+            "position_mode_acceptance_verified": position_mode_acceptance_verified,
+            "position_mode_acceptance_unverified": position_mode_acceptance_unverified,
+            "blocking_reason_count": len(blocking_reasons),
+            "blocking_reasons": ",".join(blocking_reasons),
             "direction_test_confirmed": self.direction_test_confirmed,
             "fcu_connected": connected,
             "fcu_armed": bool(state and state.armed),
             "fcu_mode": state.mode if state else "unknown",
             "fastlio_fresh": source_fresh,
             "fastlio_rate_hz": "{:.2f}".format(source_rate),
+            "fastlio_age_s": self._format_age(source_age),
             "vision_fresh": vision_fresh,
             "vision_rate_hz": "{:.2f}".format(vision_rate),
+            "vision_age_s": self._format_age(vision_age),
             "required_flight_pose_rate_hz": "{:.1f}".format(
                 self.flight_min_pose_rate_hz
             ),
             "bridge_ok": bridge_ok,
-            "bridge_state": bridge.message if bridge else "missing",
-            "px4_estimator_ready": estimator_ok,
-            "px4_local_pose_fresh": local_pose_ok,
+            "bridge_diagnostics_fresh": bridge_diagnostics_fresh,
+            "bridge_fault": bridge_fault,
+            "bridge_gate_blocked": bridge_gate_blocked,
+            "bridge_waiting": bridge_waiting,
+            "bridge_state": bridge_state,
+            "px4_estimator_status_fresh": estimator_fresh,
+            "px4_solution_flags_ok": solution_flags_ok,
+            "px4_solution_flags_source_agnostic": True,
+            "px4_solution_flag_attitude": self._solution_flag(
+                estimator, estimator_fresh, "attitude_status_flag"
+            ),
+            "px4_solution_flag_velocity_horiz": self._solution_flag(
+                estimator, estimator_fresh, "velocity_horiz_status_flag"
+            ),
+            "px4_solution_flag_velocity_vert": self._solution_flag(
+                estimator, estimator_fresh, "velocity_vert_status_flag"
+            ),
+            "px4_solution_flag_pos_horiz_rel": self._solution_flag(
+                estimator, estimator_fresh, "pos_horiz_rel_status_flag"
+            ),
+            "px4_solution_flag_pos_horiz_abs": self._solution_flag(
+                estimator, estimator_fresh, "pos_horiz_abs_status_flag"
+            ),
+            "px4_solution_flag_pos_vert_abs": self._solution_flag(
+                estimator, estimator_fresh, "pos_vert_abs_status_flag"
+            ),
+            "px4_solution_flag_pos_vert_agl": self._solution_flag(
+                estimator, estimator_fresh, "pos_vert_agl_status_flag"
+            ),
+            "px4_solution_flag_const_pos_mode": self._solution_flag(
+                estimator, estimator_fresh, "const_pos_mode_status_flag"
+            ),
+            "px4_solution_flag_pred_pos_horiz_rel": self._solution_flag(
+                estimator, estimator_fresh, "pred_pos_horiz_rel_status_flag"
+            ),
+            "px4_solution_flag_pred_pos_horiz_abs": self._solution_flag(
+                estimator, estimator_fresh, "pred_pos_horiz_abs_status_flag"
+            ),
+            "px4_solution_flag_gps_glitch": self._solution_flag(
+                estimator, estimator_fresh, "gps_glitch_status_flag"
+            ),
+            "px4_solution_flag_accel_error": self._solution_flag(
+                estimator, estimator_fresh, "accel_error_status_flag"
+            ),
+            "px4_local_pose_fresh": local_pose_fresh,
+            "px4_local_pose_continuous": local_pose_continuous,
+            "px4_local_pose_rate_hz": "{:.2f}".format(local_pose_rate),
+            "px4_local_pose_sample_count": local_pose_samples,
+            "px4_local_pose_age_s": self._format_age(local_pose_age),
+            "required_local_pose_rate_hz": "{:.1f}".format(
+                self.local_pose_min_rate_hz
+            ),
+            "required_local_pose_samples": self.min_local_pose_samples,
             "timesync_ok": timesync_ok,
             "timesync_rtt_ms": (
                 "unknown" if not math.isfinite(rtt_ms) else "{:.3f}".format(rtt_ms)
@@ -328,6 +502,16 @@ class AiryPx4Monitor:
             "recent_px4_fault": self.recent_fcu_fault if fcu_fault_active else "none",
         }
         return level, summary, values
+
+    @staticmethod
+    def _format_age(age):
+        return "missing" if not math.isfinite(age) else "{:.3f}".format(age)
+
+    @staticmethod
+    def _solution_flag(estimator, estimator_fresh, attribute):
+        if not estimator_fresh:
+            return "missing"
+        return bool(getattr(estimator, attribute))
 
     def _timer_cb(self, _event):
         now = rospy.Time.now()

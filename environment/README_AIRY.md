@@ -1,6 +1,10 @@
 # RoboSense Airy 环境与接线检查
 
-本目录使用 RoboSense 官方 `rslidar_sdk` v1.5.19 及其 `rs_driver` 子模块。
+本文件只补充驱动目录的接线和输入说明。完整部署流程以根目录
+[快速部署手册](../README.md)为准，参数、标定和二次开发见
+[完整项目手册](../AIRY_FASTLIO_MANUAL.md)。
+
+本目录使用 RoboSense `rslidar_sdk` v1.5.19 及随仓库维护的 `rs_driver` 源码树。
 Airy 配置在 `rslidar_sdk/config/config_airy.yaml`，默认接收端口为：
 
 | 数据 | UDP 端口 | ROS 话题 |
@@ -46,12 +50,12 @@ source shfile/setup_fastlio2_Airy.bash
 roslaunch fast_lio mapping_airy.launch
 ```
 
-驱动固定编译为 `XYZIRT`，其 PointCloud2 必须包含 `x/y/z/intensity/ring/
-timestamp` 字段。FAST-LIO Airy 预处理器会把绝对秒时间戳转换成每帧内的
+驱动固定编译为 `XYZIRT`，其 PointCloud2 必须包含
+`x/y/z/intensity/ring/timestamp` 字段。FAST-LIO Airy 预处理器会把绝对秒时间戳转换成每帧内的
 毫秒偏移，用于运动畸变补偿。不要改回默认的 `XYZI`。
 
-当前这台 Airy 实测的设备时间是“开机相对时间”，不是 Unix/UTC：它与 Orin
-系统时间相差约 1787838951 秒，不能直接送入 MAVROS/PX4。因此驱动配置固定为
+当前验证设备的时间是“开机相对时间”，不是 Unix/UTC，不能直接送入 MAVROS/PX4。
+因此驱动配置固定为
 `use_lidar_clock: false`，点云、逐点时间和 IMU 使用 Orin 主机时间轴。只有在
 雷达已通过 PTP/GPS 得到 UTC、并用自检确认与 ROS 系统时间误差小于 1 秒后，
 才允许改回 `true`。

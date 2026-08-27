@@ -58,6 +58,7 @@ nohup.out
 /core.[0-9]*
 Log/*.txt
 Log/*.log
+/Log/*.csv
 /log/
 /.ros/
 /runtime/

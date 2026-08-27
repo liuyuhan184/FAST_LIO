@@ -153,6 +153,9 @@ class FastlioToMavrosBridge:
             rospy.get_param("~max_timesync_offset_std_ms", 5.0)
         )
         self.max_source_gap_s = float(rospy.get_param("~max_source_gap_s", 0.30))
+        self.max_receipt_stall_s = float(
+            rospy.get_param("~max_receipt_stall_s", self.max_source_age_s)
+        )
         self.max_position_jump_m = float(rospy.get_param("~max_position_jump_m", 1.0))
         self.max_orientation_jump_deg = float(
             rospy.get_param("~max_orientation_jump_deg", 45.0)
@@ -191,6 +194,10 @@ class FastlioToMavrosBridge:
         self.last_source_rotation = None
         self.source_receipts = deque(maxlen=200)
         self.last_valid_source_receipt = None
+        self.last_source_receipt_gap_s = 0.0
+        self.max_observed_source_receipt_gap_s = 0.0
+        self.last_source_gap_s = 0.0
+        self.max_observed_source_gap_s = 0.0
         self.output_receipts = deque(maxlen=200)
         self.stable_since = None
         self.alignment_candidate = None
@@ -491,6 +498,11 @@ class FastlioToMavrosBridge:
         now = rospy.Time.now()
         now_sec = now.to_sec()
         with self.lock:
+            # A latched fault is restart-only by design.  Freeze the triggering
+            # gap and rejection details instead of letting every later source
+            # callback inflate them into a misleading multi-second value.
+            if self.latched_fault:
+                return
             try:
                 stamp, position, rotation = self._validate_odom(message, now)
             except RuntimeError as error:
@@ -500,14 +512,40 @@ class FastlioToMavrosBridge:
                 self._reject(str(error), latch=False)
                 return
 
-            source_gap = (
+            # A callback can be delayed briefly by Linux scheduling while ROS
+            # has already queued every odometry message.  Treat header-stamp
+            # spacing as the actual source-frame gap; retain receipt spacing as
+            # a separate process/scheduling-stall gate with a looser threshold.
+            # _health() also detects an input that remains stale without any
+            # callback returning.
+            receipt_gap = (
                 0.0 if self.last_valid_source_receipt is None
                 else now_sec - self.last_valid_source_receipt
             )
+            source_gap = (
+                0.0 if self.last_source_stamp is None
+                else stamp - self.last_source_stamp
+            )
+            self.last_source_receipt_gap_s = receipt_gap
+            self.max_observed_source_receipt_gap_s = max(
+                self.max_observed_source_receipt_gap_s, receipt_gap
+            )
+            self.last_source_gap_s = source_gap
+            self.max_observed_source_gap_s = max(
+                self.max_observed_source_gap_s, source_gap
+            )
             if self.aligned and source_gap > self.max_source_gap_s:
                 self._reject(
-                    "FAST-LIO valid-message gap {:.3f}s exceeded {:.3f}s".format(
+                    "FAST-LIO source timestamp gap {:.3f}s exceeded {:.3f}s".format(
                         source_gap, self.max_source_gap_s
+                    ),
+                    latch=True,
+                )
+                return
+            if self.aligned and receipt_gap > self.max_receipt_stall_s:
+                self._reject(
+                    "bridge callback receipt stall {:.3f}s exceeded {:.3f}s".format(
+                        receipt_gap, self.max_receipt_stall_s
                     ),
                     latch=True,
                 )
@@ -599,6 +637,20 @@ class FastlioToMavrosBridge:
                 "input_rate_hz": "{:.2f}".format(self._rate(self.source_receipts)),
                 "output_rate_hz": "{:.2f}".format(self._rate(self.output_receipts)),
                 "input_age_s": "{:.3f}".format(source_age),
+                "last_source_gap_s": "{:.3f}".format(self.last_source_gap_s),
+                "max_observed_source_gap_s": "{:.3f}".format(
+                    self.max_observed_source_gap_s
+                ),
+                "last_source_receipt_gap_s": "{:.3f}".format(
+                    self.last_source_receipt_gap_s
+                ),
+                "max_observed_source_receipt_gap_s": "{:.3f}".format(
+                    self.max_observed_source_receipt_gap_s
+                ),
+                "max_receipt_stall_s": "{:.3f}".format(
+                    self.max_receipt_stall_s
+                ),
+                "max_source_gap_s": "{:.3f}".format(self.max_source_gap_s),
                 "state_age_s": (
                     "unknown" if self.state_receive_time is None
                     else "{:.3f}".format((now - self.state_receive_time).to_sec())

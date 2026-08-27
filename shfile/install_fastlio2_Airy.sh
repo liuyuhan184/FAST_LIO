@@ -10,6 +10,8 @@ readonly RSLIDAR_SOURCE_DIR="${PROJECT_ROOT}/environment/rslidar_sdk"
 readonly RSLIDAR_WORKSPACE="${PROJECT_ROOT}/environment/rslidar_ws"
 readonly RSLIDAR_PACKAGE_LINK="${RSLIDAR_WORKSPACE}/src/rslidar_sdk"
 readonly TARGET_ROS_DISTRO="noetic"
+readonly AIRY_SYSCTL_TEMPLATE="${SCRIPT_DIR}/99-fastlio-airy.conf"
+readonly AIRY_SYSCTL_TARGET="/etc/sysctl.d/99-fastlio-airy.conf"
 
 BUILD_JOBS="${BUILD_JOBS:-}"
 SKIP_APT_UPDATE="${SKIP_APT_UPDATE:-0}"
@@ -40,7 +42,8 @@ usage() {
 用法：bash shfile/install_fastlio2_Airy.sh [选项]
 
 默认行为：安装 Ubuntu/ROS 依赖，编译支持在线雷达和离线 PCAP 的 Airy 驱动，
-再编译 FAST-LIO2。重复运行会复用已有源码并增量构建。
+再编译 FAST-LIO2，并持久配置 Airy 所需 UDP 接收缓冲。重复运行会复用已有源码、
+增量构建并幂等更新 /etc/sysctl.d/99-fastlio-airy.conf。
 
 构建选项：
   --jobs N                    指定并行编译任务数
@@ -48,7 +51,7 @@ usage() {
   --online-only               禁用 PCAP 解析，不要求 libpcap-dev
   --skip-apt-update           安装依赖前跳过 apt-get update
   --desktop-full              安装 ros-noetic-desktop-full（含 RViz）
-  --allow-unsupported-os      允许在非 Ubuntu 20.04 上尝试
+  --allow-unsupported-os      允许在非 20.04 的其他 Ubuntu 版本上尝试
 
 可选网络配置（只有明确传入 --configure-network 才会修改连接）：
   --configure-network NAME    将 NetworkManager 有线连接 NAME 配为 Airy 专网
@@ -188,7 +191,7 @@ collect_dependency_packages() {
   )
   [[ "${ONLINE_ONLY}" == "1" ]] || packages_ref+=(libpcap-dev)
   [[ "${INSTALL_DESKTOP_FULL}" != "1" ]] || packages_ref+=(ros-noetic-desktop-full)
-  [[ "${CONFIGURE_NETWORK}" != "1" ]] || packages_ref+=(network-manager iproute2 iputils-ping)
+  [[ "${CONFIGURE_NETWORK}" != "1" ]] || packages_ref+=(network-manager)
 }
 
 validate_sources() {
@@ -207,12 +210,14 @@ validate_sources() {
   require_file "${PROJECT_ROOT}/shfile/stop_airy_px4.sh"
   require_file "${PROJECT_ROOT}/shfile/fastlio_to_mavros.py"
   require_file "${PROJECT_ROOT}/shfile/monitor_airy_px4.py"
+  require_file "${PROJECT_ROOT}/shfile/calibrate_airy_body.py"
   require_file "${PROJECT_ROOT}/shfile/check_airy_topics.sh"
   require_file "${PROJECT_ROOT}/shfile/airy_px4.env.example"
+  require_file "${AIRY_SYSCTL_TEMPLATE}"
   grep -Eq '^[[:space:]]*use_lidar_clock:[[:space:]]*false([[:space:]]|$)' \
     "${RSLIDAR_SOURCE_DIR}/config/config_airy.yaml" || \
     warn "use_lidar_clock 不是 false；只有已验证 PTP/GPS UTC 同步时才允许使用雷达时钟。"
-  info "官方 rslidar_sdk、rs_driver 子模块和 FAST-LIO2 Airy 配置检查通过。"
+  info "rslidar_sdk、仓库内 rs_driver 源码和 FAST-LIO2 Airy 配置检查通过。"
 }
 
 acquire_sudo() {
@@ -290,6 +295,8 @@ install_dependencies() {
   CURRENT_STAGE="安装基础依赖"
   local -a packages=()
   collect_dependency_packages packages
+  # 运行手册中的网络验收工具；不列入 --build-only 的编译依赖检查。
+  packages+=(iproute2 iputils-ping tcpdump)
   if [[ "${SKIP_APT_UPDATE}" != "1" ]]; then
     "${ROOT_CMD[@]}" apt-get update
   else
@@ -389,6 +396,30 @@ configure_airy_network() {
   [[ "${ipv6_method}" == "disabled" ]] || \
     die "网络配置复核失败：ipv6.method=${ipv6_method}"
   info "网络配置复核通过：无网关、不接管默认路由、IPv6 已禁用。"
+}
+
+configure_airy_udp_buffers() {
+  CURRENT_STAGE="配置 Airy UDP 接收缓冲"
+  local rmem_max="0" backlog="0"
+
+  if [[ "${BUILD_ONLY}" != "1" ]]; then
+    "${ROOT_CMD[@]}" install -m 0644 "${AIRY_SYSCTL_TEMPLATE}" "${AIRY_SYSCTL_TARGET}"
+    "${ROOT_CMD[@]}" sysctl -p "${AIRY_SYSCTL_TARGET}" >/dev/null
+    info "已持久写入 ${AIRY_SYSCTL_TARGET}。"
+  fi
+
+  rmem_max="$(sysctl -n net.core.rmem_max 2>/dev/null || printf '0')"
+  backlog="$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || printf '0')"
+  if [[ "${rmem_max}" =~ ^[0-9]+$ ]] && ((rmem_max >= 4194304)); then
+    info "Airy UDP 接收上限检查通过：net.core.rmem_max=${rmem_max}。"
+  else
+    warn "net.core.rmem_max=${rmem_max:-unknown}，低于 rs_driver 请求的 4194304；在线运行可能丢包。"
+  fi
+  if [[ "${backlog}" =~ ^[0-9]+$ ]] && ((backlog >= 5000)); then
+    info "网卡接收 backlog 检查通过：net.core.netdev_max_backlog=${backlog}。"
+  else
+    warn "net.core.netdev_max_backlog=${backlog:-unknown}，高负载时可能出现接收队列丢包。"
+  fi
 }
 
 check_airy_network() {
@@ -530,9 +561,16 @@ verify() {
   [[ "$(rospack find fast_lio)" == "${PROJECT_ROOT}" ]] || die "ROS 没有找到当前 fast_lio。"
   roslaunch --files rslidar_sdk start_airy.launch >/dev/null
   roslaunch --files fast_lio mapping_airy.launch >/dev/null
-  bash -n "${SCRIPT_DIR}/start_airy_px4.sh" "${SCRIPT_DIR}/stop_airy_px4.sh"
-  python3 -m py_compile "${SCRIPT_DIR}/fastlio_to_mavros.py" "${SCRIPT_DIR}/monitor_airy_px4.py"
+  bash -n "${SCRIPT_DIR}/setup_fastlio2_Airy.bash"
+  bash -n "${SCRIPT_DIR}/check_airy_topics.sh"
+  bash -n "${SCRIPT_DIR}/start_airy_px4.sh"
+  bash -n "${SCRIPT_DIR}/stop_airy_px4.sh"
+  python3 -m py_compile \
+    "${SCRIPT_DIR}/fastlio_to_mavros.py" \
+    "${SCRIPT_DIR}/monitor_airy_px4.py" \
+    "${SCRIPT_DIR}/calibrate_airy_body.py"
   python3 "${SCRIPT_DIR}/fastlio_to_mavros.py" --self-test >/dev/null
+  python3 "${SCRIPT_DIR}/calibrate_airy_body.py" --self-test >/dev/null
 
   printf '\n%sAiry + FAST-LIO2 部署完成。%s\n' "${GREEN}" "${RESET}"
   if [[ "${ONLINE_ONLY}" == "1" ]]; then
@@ -572,6 +610,7 @@ main() {
     install_dependencies
   fi
   [[ "${CONFIGURE_NETWORK}" != "1" ]] || configure_airy_network
+  configure_airy_udp_buffers
   prepare_rslidar_workspace
   build_rslidar
   build_fastlio

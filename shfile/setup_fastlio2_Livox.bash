@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 使用方法：source shfile/setup_fastlio2.bash
+# 使用方法：source shfile/setup_fastlio2_Livox.bash
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  printf '[ERROR] 请使用 source 加载此文件：source shfile/setup_fastlio2.bash\n' >&2
+  printf '[ERROR] 请使用 source 加载此文件：source shfile/setup_fastlio2_Livox.bash\n' >&2
   exit 1
 fi
 
@@ -29,7 +29,7 @@ for _fastlio_setup_file in \
   "${_fastlio_project_setup}"; do
   if [[ ! -f "${_fastlio_setup_file}" ]]; then
     printf '[ERROR] 找不到环境文件：%s\n' "${_fastlio_setup_file}" >&2
-    printf '请先运行：bash "%s/shfile/install_fastlio2.sh"\n' "${FAST_LIO_ROOT}" >&2
+    printf '请先运行：bash "%s/shfile/install_fastlio2_Livox.sh"\n' "${FAST_LIO_ROOT}" >&2
     unset _fastlio_setup_dir _fastlio_ros_distro _fastlio_dpkg_arch
     unset _fastlio_build_tag _fastlio_ros_setup _fastlio_driver_setup
     unset _fastlio_project_setup _fastlio_setup_file
