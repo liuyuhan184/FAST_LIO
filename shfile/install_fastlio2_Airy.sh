@@ -206,6 +206,7 @@ validate_sources() {
   require_file "${RSLIDAR_SOURCE_DIR}/src/rs_driver/src/rs_driver/driver/decoder/decoder_RSAIRY.hpp"
   require_file "${PROJECT_ROOT}/config/airy.yaml"
   require_file "${PROJECT_ROOT}/launch/mapping_airy.launch"
+  require_file "${PROJECT_ROOT}/launch/mavros_px4_safe.launch"
   require_file "${PROJECT_ROOT}/shfile/start_airy_px4.sh"
   require_file "${PROJECT_ROOT}/shfile/stop_airy_px4.sh"
   require_file "${PROJECT_ROOT}/shfile/fastlio_to_mavros.py"
@@ -533,11 +534,18 @@ build_fastlio() {
   [[ -s "${FASTLIO_DEVEL_DIR}/lib/fast_lio/fastlio_mapping" ]] || \
     die "fastlio_mapping 为空文件。"
   require_file "${FASTLIO_BUILD_DIR}/CMakeCache.txt"
-  require_file "${FASTLIO_BUILD_DIR}/CMakeFiles/fastlio_mapping.dir/flags.make"
+  local fastlio_flags="${FASTLIO_BUILD_DIR}/CMakeFiles/fastlio_mapping.dir/flags.make"
+  require_file "${fastlio_flags}"
   grep -q '^CMAKE_BUILD_TYPE:STRING=Release$' "${FASTLIO_BUILD_DIR}/CMakeCache.txt" || \
     die "FAST-LIO2 不是 Release 构建。"
   grep -q '^ENABLE_LIVOX_SUPPORT:BOOL=OFF$' "${FASTLIO_BUILD_DIR}/CMakeCache.txt" || \
     die "FAST-LIO2 Airy 构建错误地启用了 Livox 依赖。"
+  grep -q -- '-DMP_PROC_NUM=' "${fastlio_flags}" || \
+    die "FAST-LIO2 构建缺少匹配线程数宏。"
+  if (( $(nproc) > 2 )); then
+    grep -q -- '-DMP_EN' "${fastlio_flags}" || \
+      die "多核平台上的 FAST-LIO2 没有启用 OpenMP 匹配循环。"
+  fi
 }
 
 verify() {
@@ -556,11 +564,13 @@ verify() {
   [[ -x "${fastlio}" && -s "${fastlio}" ]] || die "FAST-LIO2 产物无效：${fastlio}"
   missing="$(ldd "${driver}" "${fastlio}" | awk '/not found/ {print}' || true)"
   [[ -z "${missing}" ]] || die "存在未解析动态库：${missing}"
+  ldd "${fastlio}" | grep -q 'libgomp' || die "FAST-LIO2 没有链接 OpenMP/libgomp。"
   [[ "$(realpath "$(rospack find rslidar_sdk)")" == "${RSLIDAR_SOURCE_DIR}" ]] || \
     die "ROS 没有找到 environment/rslidar_sdk。"
   [[ "$(rospack find fast_lio)" == "${PROJECT_ROOT}" ]] || die "ROS 没有找到当前 fast_lio。"
   roslaunch --files rslidar_sdk start_airy.launch >/dev/null
   roslaunch --files fast_lio mapping_airy.launch >/dev/null
+  roslaunch --files "${PROJECT_ROOT}/launch/mavros_px4_safe.launch" >/dev/null
   bash -n "${SCRIPT_DIR}/setup_fastlio2_Airy.bash"
   bash -n "${SCRIPT_DIR}/check_airy_topics.sh"
   bash -n "${SCRIPT_DIR}/start_airy_px4.sh"

@@ -30,5 +30,7 @@ lidar:
       ros_send_imu_data_topic: /rslidar_imu_data
       ros_recv_packet_topic: /rslidar_packets
       ros_send_packet_topic: /rslidar_packets
-      ros_queue_length: 100
+      # Keep only a very small outgoing history. FAST-LIO has its own bounded
+      # latest-frame policy; a large ROS publisher queue recreates old-data lag.
+      ros_queue_length: 1
       ros_send_by_rows: false

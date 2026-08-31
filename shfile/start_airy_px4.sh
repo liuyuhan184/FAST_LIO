@@ -9,6 +9,7 @@ readonly PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly AIRY_SETUP="${SCRIPT_DIR}/setup_fastlio2_Airy.bash"
 readonly BRIDGE_SCRIPT="${SCRIPT_DIR}/fastlio_to_mavros.py"
 readonly MONITOR_SCRIPT="${SCRIPT_DIR}/monitor_airy_px4.py"
+readonly MAVROS_SAFE_LAUNCH="${PROJECT_ROOT}/launch/mavros_px4_safe.launch"
 readonly MIN_AIRY_UDP_RMEM_MAX=4194304
 
 # Safe defaults.  A local shfile/airy_px4.env may override them.
@@ -593,6 +594,35 @@ wait_for_topic_message() {
   done
 }
 
+normalise_ros_string() {
+  local value="$1"
+  case "${value}" in
+    "''"|'""'|null|'~') printf '' ;;
+    \'*\') value="${value#\'}"; printf '%s' "${value%\'}" ;;
+    \"*\") value="${value#\"}"; printf '%s' "${value%\"}" ;;
+    *) printf '%s' "${value}" ;;
+  esac
+}
+
+verify_mavros_gcs_url() {
+  local raw actual
+  raw="$(rosparam get "${MAVROS_PREFIX}/gcs_url" 2>/dev/null)" || return 1
+  actual="$(normalise_ros_string "${raw}")"
+  if [[ -z "${GCS_URL}" ]]; then
+    [[ -z "${actual}" ]] || {
+      warn "MAVROS 意外启用了 GCS 转发：${actual}。"
+      return 1
+    }
+    info "MAVROS GCS 转发已明确禁用。"
+  else
+    [[ "${actual}" == "${GCS_URL}" ]] || {
+      warn "MAVROS GCS URL 与请求不符：期望 ${GCS_URL}，实际 ${actual:-<empty>}。"
+      return 1
+    }
+    info "MAVROS GCS 转发地址核验通过：${actual}。"
+  fi
+}
+
 state_snapshot() {
   timeout 3s rostopic echo -n 1 "${STATE_TOPIC}" 2>/dev/null || true
 }
@@ -721,7 +751,7 @@ diagnostic_value() {
 
 assert_diagnostic_test() {
   local failures=0 snapshot bridge_status monitor_status
-  local connected armed bridge_message input_rate input_age output_rate last_rejection
+  local connected armed bridge_message input_rate input_age source_stamp_age output_rate last_rejection
   local monitor_message timesync_ok solution_flags_ok local_pose_continuous
   local vision_fresh bridge_ok bridge_state bridge_gate_blocked recent_px4_fault
   local ev_fusion_verified position_mode_acceptance_verified
@@ -737,6 +767,7 @@ assert_diagnostic_test() {
   bridge_message="$(awk '/^[[:space:]]*message:/ {gsub(/"/, "", $2); print $2; exit}' <<<"${bridge_status}")"
   input_rate="$(diagnostic_value "${bridge_status}" input_rate_hz)"
   input_age="$(diagnostic_value "${bridge_status}" input_age_s)"
+  source_stamp_age="$(diagnostic_value "${bridge_status}" source_stamp_age_s)"
   output_rate="$(diagnostic_value "${bridge_status}" output_rate_hz)"
   last_rejection="$(diagnostic_value "${bridge_status}" last_rejection)"
   if [[ "${PUBLISH_EFFECTIVE}" == "1" ]]; then
@@ -760,6 +791,12 @@ assert_diagnostic_test() {
     awk -v value="${input_age}" -v maximum="${MAX_SOURCE_AGE_S}" \
       'BEGIN {exit !(value+0 >= 0 && value+0 <= maximum+0)}' || {
       warn "验收失败：FAST-LIO 位姿时间新鲜度 ${input_age:-missing} s。"
+      failures=$((failures + 1))
+    }
+  [[ "${source_stamp_age}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && \
+    awk -v value="${source_stamp_age}" -v maximum="${MAX_SOURCE_AGE_S}" \
+      'BEGIN {exit !(value+0 >= -0.2 && value+0 <= maximum+0)}' || {
+      warn "验收失败：FAST-LIO header.stamp 延迟 ${source_stamp_age:-missing} s。"
       failures=$((failures + 1))
     }
   if [[ "${PUBLISH_EFFECTIVE}" == "1" ]]; then
@@ -921,11 +958,12 @@ EOF
   exit 0
 fi
 
-for command_name in roscore roslaunch rosnode rostopic rosservice rospack timeout setsid python3; do
+for command_name in roscore roslaunch rosnode rostopic rosservice rosparam rospack timeout setsid python3; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
 done
 [[ -f "${BRIDGE_SCRIPT}" ]] || die "缺少桥接脚本：${BRIDGE_SCRIPT}"
 [[ -f "${MONITOR_SCRIPT}" ]] || die "缺少监控脚本：${MONITOR_SCRIPT}"
+[[ -f "${MAVROS_SAFE_LAUNCH}" ]] || die "缺少受控 MAVROS launch：${MAVROS_SAFE_LAUNCH}"
 
 if [[ "${PRINT_STATUS_ONLY}" == "1" ]]; then
   master_online || die "ROS master 未运行。"
@@ -976,11 +1014,17 @@ if [[ "${START_MAVROS}" == "1" ]]; then
   fi
   rospack find mavros >/dev/null 2>&1 || die "未安装 ros-noetic-mavros。"
   rospack find mavros_extras >/dev/null 2>&1 || die "未安装 ros-noetic-mavros-extras（vision_pose 插件在该包中）。"
+  mavros_launch_args=(
+    "${MAVROS_SAFE_LAUNCH}"
+    "fcu_url:=${FCU_URL}"
+    "tgt_system:=${MAV_SYS_ID}"
+    "tgt_component:=${MAV_COMP_ID}"
+    "log_output:=screen"
+    "respawn_mavros:=false"
+  )
+  [[ -z "${GCS_URL}" ]] || mavros_launch_args+=("gcs_url:=${GCS_URL}")
   start_component mavros "${LOG_DIR}/mavros.log" \
-    env ROS_NAMESPACE="${UAV_NAME}" roslaunch mavros px4.launch \
-      "fcu_url:=${FCU_URL}" "gcs_url:=${GCS_URL}" \
-      "tgt_system:=${MAV_SYS_ID}" "tgt_component:=${MAV_COMP_ID}" \
-      log_output:=screen respawn_mavros:=false
+    env ROS_NAMESPACE="${UAV_NAME}" roslaunch "${mavros_launch_args[@]}"
 elif ! node_exists "${MAVROS_PREFIX}"; then
   die "START_MAVROS=0，但没有找到已有 ${MAVROS_PREFIX}。"
 fi
@@ -990,6 +1034,7 @@ wait_for_fcu_disarmed 30 || {
   die "30 秒内未建立未解锁的 PX4/MAVROS 链路。"
 }
 info "PX4/MAVROS 已连接，当前保持未解锁。"
+verify_mavros_gcs_url || die "MAVROS GCS 转发配置不符合请求；拒绝继续启动。"
 
 PUBLISH_EFFECTIVE=0
 PUBLISH_BLOCK_REASONS=()

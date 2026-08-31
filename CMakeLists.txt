@@ -14,26 +14,43 @@ add_compile_options(-fexceptions -pthread)
 add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
 
 message(STATUS "Current CPU architecture: ${CMAKE_SYSTEM_PROCESSOR}")
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-  include(ProcessorCount)
-  ProcessorCount(N)
-  message(STATUS "Processor count: ${N}")
-  if(N GREATER 4)
-    add_definitions(-DMP_EN -DMP_PROC_NUM=3)
-  elseif(N GREATER 3)
-    add_definitions(-DMP_EN -DMP_PROC_NUM=2)
+include(ProcessorCount)
+ProcessorCount(FAST_LIO_PROCESSOR_COUNT)
+if(NOT FAST_LIO_PROCESSOR_COUNT OR FAST_LIO_PROCESSOR_COUNT LESS 1)
+  set(FAST_LIO_PROCESSOR_COUNT 1)
+endif()
+message(STATUS "Processor count: ${FAST_LIO_PROCESSOR_COUNT}")
+
+# 0 selects a conservative automatic value.  The matching loop is memory
+# intensive, so using every Orin core is slower and also starves the LiDAR
+# driver/MAVROS.  Three workers is the original FAST-LIO upper bound on x86 and
+# works well on the 8-core Orin NX.
+set(FAST_LIO_MP_THREADS 0 CACHE STRING
+    "OpenMP workers for FAST-LIO matching (0: auto, 1: serial)")
+if(FAST_LIO_MP_THREADS LESS 0)
+  message(FATAL_ERROR "FAST_LIO_MP_THREADS must be >= 0")
+endif()
+set(FAST_LIO_EFFECTIVE_MP_THREADS ${FAST_LIO_MP_THREADS})
+if(FAST_LIO_EFFECTIVE_MP_THREADS EQUAL 0)
+  if(FAST_LIO_PROCESSOR_COUNT GREATER 4)
+    set(FAST_LIO_EFFECTIVE_MP_THREADS 3)
+  elseif(FAST_LIO_PROCESSOR_COUNT GREATER 2)
+    set(FAST_LIO_EFFECTIVE_MP_THREADS 2)
   else()
-    add_definitions(-DMP_PROC_NUM=1)
+    set(FAST_LIO_EFFECTIVE_MP_THREADS 1)
   endif()
+endif()
+
+find_package(OpenMP REQUIRED)
+if(FAST_LIO_EFFECTIVE_MP_THREADS GREATER 1)
+  add_definitions(
+    -DMP_EN
+    -DMP_PROC_NUM=${FAST_LIO_EFFECTIVE_MP_THREADS}
+  )
 else()
   add_definitions(-DMP_PROC_NUM=1)
 endif()
-
-find_package(OpenMP QUIET)
-if(OpenMP_CXX_FOUND)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-endif()
+message(STATUS "FAST-LIO matching threads: ${FAST_LIO_EFFECTIVE_MP_THREADS}")
 
 find_package(PythonLibs REQUIRED)
 
@@ -117,6 +134,7 @@ add_dependencies(
 )
 target_link_libraries(
   fastlio_mapping
+  OpenMP::OpenMP_CXX
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
   ${PYTHON_LIBRARIES}

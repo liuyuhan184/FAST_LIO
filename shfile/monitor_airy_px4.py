@@ -39,6 +39,17 @@ class Stream:
     def age(self, now_sec):
         return float("inf") if not self.receipts else now_sec - self.receipts[-1]
 
+    def stamp_age(self, now_sec):
+        message = self.last_message
+        header = getattr(message, "header", None) if message is not None else None
+        stamp = getattr(header, "stamp", None) if header is not None else None
+        if stamp is None:
+            return float("inf")
+        stamp_sec = float(stamp.to_sec())
+        if not math.isfinite(stamp_sec) or stamp_sec <= 0.0:
+            return float("inf")
+        return now_sec - stamp_sec
+
     def count(self, now_sec):
         self.trim(now_sec)
         return len(self.receipts)
@@ -112,8 +123,8 @@ class AiryPx4Monitor:
         self.publisher = rospy.Publisher(
             self.output_topic, DiagnosticArray, queue_size=10, latch=True
         )
-        rospy.Subscriber(self.source_topic, Odometry, self._source_cb, queue_size=30)
-        rospy.Subscriber(self.vision_topic, PoseStamped, self._vision_cb, queue_size=30)
+        rospy.Subscriber(self.source_topic, Odometry, self._source_cb, queue_size=1)
+        rospy.Subscriber(self.vision_topic, PoseStamped, self._vision_cb, queue_size=1)
         rospy.Subscriber(self.state_topic, State, self._state_cb, queue_size=20)
         rospy.Subscriber(
             self.estimator_topic, EstimatorStatus, self._estimator_cb, queue_size=20
@@ -219,8 +230,10 @@ class AiryPx4Monitor:
         vision_rate = self.vision.rate(now_sec)
         local_pose_rate = self.local_pose.rate(now_sec)
         local_pose_samples = self.local_pose.count(now_sec)
-        source_age = self.source.age(now_sec)
-        vision_age = self.vision.age(now_sec)
+        source_receipt_age = self.source.age(now_sec)
+        source_stamp_age = self.source.stamp_age(now_sec)
+        vision_receipt_age = self.vision.age(now_sec)
+        vision_stamp_age = self.vision.stamp_age(now_sec)
         local_pose_age = self.local_pose.age(now_sec)
         estimator_age = self.estimator.age(now_sec)
         bridge_age = self.bridge.age(now_sec)
@@ -233,11 +246,13 @@ class AiryPx4Monitor:
             state and self.state.age(now_sec) < 2.0 and state.connected
         )
         source_fresh = (
-            source_age <= self.max_data_age_s
+            source_receipt_age <= self.max_data_age_s
+            and -0.20 <= source_stamp_age <= self.max_data_age_s
             and source_rate >= self.source_min_rate_hz
         )
         vision_fresh = (
-            vision_age <= self.max_data_age_s
+            vision_receipt_age <= self.max_data_age_s
+            and -0.20 <= vision_stamp_age <= self.max_data_age_s
             and vision_rate >= self.source_min_rate_hz
             and self._pose_is_finite(self.vision.last_message)
         )
@@ -429,10 +444,16 @@ class AiryPx4Monitor:
             "fcu_mode": state.mode if state else "unknown",
             "fastlio_fresh": source_fresh,
             "fastlio_rate_hz": "{:.2f}".format(source_rate),
-            "fastlio_age_s": self._format_age(source_age),
+            # Keep the historical field as receipt age for compatibility, and
+            # expose the source header age explicitly so FIFO backlog is visible.
+            "fastlio_age_s": self._format_age(source_receipt_age),
+            "fastlio_receipt_age_s": self._format_age(source_receipt_age),
+            "fastlio_stamp_age_s": self._format_age(source_stamp_age),
             "vision_fresh": vision_fresh,
             "vision_rate_hz": "{:.2f}".format(vision_rate),
-            "vision_age_s": self._format_age(vision_age),
+            "vision_age_s": self._format_age(vision_receipt_age),
+            "vision_receipt_age_s": self._format_age(vision_receipt_age),
+            "vision_stamp_age_s": self._format_age(vision_stamp_age),
             "required_flight_pose_rate_hz": "{:.1f}".format(
                 self.flight_min_pose_rate_hz
             ),
@@ -530,12 +551,17 @@ class AiryPx4Monitor:
             message.header.stamp = now
             message.status = [status]
             self.publisher.publish(message)
-            compact = "{} | FCU={} armed={} mode={} | LIO={}Hz vision={}Hz | bridge={}".format(
+            compact = (
+                "{} | FCU={} armed={} mode={} | LIO={}Hz age={}s recv={}s "
+                "vision={}Hz | bridge={}"
+            ).format(
                 summary,
                 values["fcu_connected"],
                 values["fcu_armed"],
                 values["fcu_mode"],
                 values["fastlio_rate_hz"],
+                values["fastlio_stamp_age_s"],
+                values["fastlio_receipt_age_s"],
                 values["vision_rate_hz"],
                 values["bridge_state"],
             )

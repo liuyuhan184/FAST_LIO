@@ -97,7 +97,8 @@ bash shfile/install_fastlio2_Airy.sh [选项]
 4. 可选修改指定 NetworkManager 连接；
 5. 把 `99-fastlio-airy.conf` 安装到 `/etc/sysctl.d/` 并应用；
 6. 以 Release、`XYZIRT`、`ENABLE_IMU_DATA_PARSE=ON` 构建驱动；
-7. 以 Release、`ENABLE_LIVOX_SUPPORT=OFF` 构建 Airy FAST-LIO；
+7. 以 Release、`ENABLE_LIVOX_SUPPORT=OFF` 构建 Airy FAST-LIO；Orin 多核平台默认启用
+   3 个 OpenMP 匹配线程；
 8. 检查动态库、CMake cache、ROS launch、Shell/Python 语法和 Python 自测。
 
 脚本重复运行会复用源码和做增量构建。它不会克隆缺失的项目源码，也不会添加 ROS APT
@@ -117,6 +118,12 @@ build/noetic-<arch>-airy/
 ```
 
 不要跨 amd64/ARM64 复制构建产物。Orin 编译被系统杀死时使用 `--jobs 1`。
+
+当前板端低延迟参数不是编译并行数：Airy ROS1 `PointCloud2` 发布队列读取
+`ros_queue_length=1`；FAST-LIO 点云订阅队列为 `1`、内部点云帧缓冲为 `2`，旧帧阈值
+为 `0.35 s`，过期 `/Odometry` 禁发阈值为 `0.45 s`。FAST-LIO 里程计发布、桥的里程计
+输入/视觉输出及监控器的源/视觉输入队列也为 `1`，形成非 IMU 位姿链的 latest-only
+策略。IMU 仍使用深队列，不能照搬为 `1`。
 
 ## 4. Airy 环境脚本
 
@@ -172,7 +179,25 @@ bash shfile/check_airy_topics.sh
 - 点云 header、逐点 timestamp、IMU 和 ROS 当前时间没有明显跨纪元。
 
 它只取少量/单条消息，不证明 10 分钟持续频率、网络无丢包或 FAST-LIO 精度。通过后还
-要使用 `rostopic hz`、`ip -s link` 和 UDP 统计做长测。
+要使用 `rostopic hz`、`rostopic delay`、`ip -s link` 和 UDP 统计做长测：
+
+```bash
+# 只启动驱动时
+rostopic hz /rslidar_points /rslidar_imu_data
+
+# 启动 FAST-LIO 后
+rostopic hz /Odometry
+rostopic delay /Odometry
+```
+
+本次修复后的短时台架实测为点云约 10 Hz、IMU 约 200 Hz、`/Odometry` 约 10 Hz，
+里程计 header 延迟约 6～29 ms。这只证明本次短测未出现持续积压，不是长时稳定性、
+定位精度、PX4 融合或装桨飞行验收。
+
+若 `rostopic delay /Odometry` 随运行时间持续增大，先确认加载的
+`config/airy.yaml` 仍是订阅 `1`、内部缓冲 `2`、旧帧 `0.35 s`、过期里程计 `0.45 s`；
+再检查重复驱动/`laserMapping`、误开启的注册点云、Orin CPU/温度降频、网卡丢包和系统
+时间跳变。不要通过放宽桥的 `MAX_SOURCE_AGE_S` 掩盖上游积压。
 
 ## 6. 飞机本机配置
 
@@ -387,6 +412,8 @@ runtime/airy_px4_locks/                 # 固定在项目内的并发锁
 
 它执行 5 秒左右的未解锁静止对齐，应用 `I -> B` 旋转和杆臂，保留 FAST-LIO 的原始
 测量时间并按原生约 10 Hz 发布。它不插值、不重复旧位姿、不发送速度或协方差。
+桥的 `/Odometry` 输入和 vision 输出队列均为 `1`，只处理最新待处理位姿，避免 Python
+回调再次形成历史队列。
 它也不读取 FAST-LIO 特征数、几何退化指标或源 covariance；只要 `/Odometry` 仍满足
 时间、频率和跳变门，遮挡/退化场景不保证自动停发。
 
@@ -428,6 +455,9 @@ estimator status 和 PX4 statustext，输出：
 ```text
 /airy_px4/monitor/diagnostics
 ```
+
+监控器对 FAST-LIO 源位姿和 vision 位姿同样使用队列 `1`，并分别报告消息接收年龄和
+header 时间戳年龄；前者用于识别回调停顿，后者用于识别“仍有输出但输出的是旧数据”。
 
 重点状态：
 

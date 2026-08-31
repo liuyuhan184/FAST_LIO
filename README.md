@@ -136,6 +136,7 @@ bash shfile/install_fastlio2_Airy.sh --build-only --online-only --jobs 2
 - 安装 ROS、PCL、Eigen、MAVROS、GeographicLib、NumPy 等依赖；
 - 以 `POINT_TYPE=XYZIRT`、`ENABLE_IMU_DATA_PARSE=ON` 编译 Airy 驱动；
 - 编译关闭 Livox 消息依赖的 Airy 版 FAST-LIO2；
+- 在 Orin 多核平台默认以 3 个 OpenMP 匹配线程构建；
 - 按 CPU 架构隔离构建结果，避免 x86 与 ARM 产物混用；
 - 安装 `/etc/sysctl.d/99-fastlio-airy.conf`，提高 UDP 接收上限；
 - 运行脚本语法、Python、自测、动态库和 ROS launch 检查。
@@ -210,14 +211,33 @@ source shfile/setup_fastlio2_Airy.bash
 roslaunch fast_lio mapping_airy.launch rviz:=true
 ```
 
+飞行配置为降低 Orin 负载，默认关闭 `/cloud_registered`、
+`/cloud_registered_body` 和稠密点云。需要临时看降采样后的配准点云时使用：
+
+```bash
+roslaunch fast_lio mapping_airy.launch rviz:=true publish_clouds:=true
+```
+
+如确有需要，可再加 `dense_cloud:=true` 或 `publish_body_cloud:=true`；这些选项只用于地面
+调试，重启后会恢复默认关闭，无需改配置文件。
+
 启动后保持雷达静止，等待日志出现 `IMU Initial Done`，再缓慢移动。检查：
 
 ```bash
-rostopic hz /rslidar_points /rslidar_imu_data /Odometry /cloud_registered
+rostopic hz /rslidar_points /rslidar_imu_data /Odometry
+rostopic delay /Odometry
 ```
 
-当前正常基线大致为：点云 10 Hz、IMU 200 Hz、`/Odometry` 10 Hz。场景点数会变化，
-不能仅按固定点数判断故障。
+本次修复后的短时台架实测为：点云约 10 Hz、IMU 约 200 Hz、`/Odometry` 约 10 Hz，
+`rostopic delay /Odometry` 约 6～29 ms。这个数字只说明本次短测没有继续积压，不是长期
+稳定性、定位精度或装桨飞行验收。场景点数会变化，不能仅按固定点数判断故障。
+
+当前低延迟配置采用“新数据优先”：Airy 的 ROS1 点云发布队列读取
+`ros_queue_length=1`；FAST-LIO 点云订阅队列为 `1`、内部点云帧缓冲上限为 `2`，主动
+丢弃年龄超过 `0.35 s` 的待处理帧，并禁止发布年龄超过 `0.45 s` 的 `/Odometry`。这会
+在 Orin 短时过载时丢旧帧，避免把几十秒前的轨迹继续送给飞控。FAST-LIO 里程计发布、
+Python 桥的里程计输入/视觉输出以及监控器的源/视觉输入队列也都是 `1`，因此整条非 IMU
+位姿链路采用 latest-only 策略。
 
 验收完成后在这个 `roslaunch` 终端按一次 `Ctrl+C`，确认 `/laserMapping` 和
 `/rslidar_sdk_node` 已退出，再继续飞机综合部署；否则综合启动器会拒绝重复节点。
@@ -396,8 +416,8 @@ runtime/airy_px4/<时间_UAV_PID>/
 | `/rslidar_points` | Airy `XYZIRT` 点云 | 约 10 Hz |
 | `/rslidar_imu_data` | Airy 内置 IMU | 约 200 Hz |
 | `/Odometry` | FAST-LIO `camera_init → body` 里程计 | 约 10 Hz |
-| `/cloud_registered` | `camera_init` 下的配准点云 | 持续 |
-| `/cloud_registered_body` | 当前 Airy IMU/body 下点云 | 持续 |
+| `/cloud_registered` | `camera_init` 下的配准点云 | 飞行配置默认关闭；地面调试时临时启用 |
+| `/cloud_registered_body` | 当前 Airy IMU/body 下点云 | 飞行配置默认关闭；通常无需启用 |
 | `/<UAV_NAME>/mavros/vision_pose/pose` | 桥送入 MAVROS 的 ENU/FLU 位姿 | 发布门控通过后约 10 Hz |
 | `/<UAV_NAME>/mavros/local_position/pose` | PX4/MAVROS 本地位姿输出 | 只作间接观察 |
 | `/airy_px4/bridge/diagnostics` | 坐标桥与失效门控状态 | 约 2 Hz；严重故障可锁存 |
@@ -415,6 +435,7 @@ runtime/airy_px4/<时间_UAV_PID>/
 | 点云缺 `ring/timestamp` | 重新运行安装脚本，确认驱动是 `XYZIRT` 构建 |
 | `roslaunch` 连接旧 IP | 重新 `source shfile/setup_fastlio2_Airy.bash` |
 | 有输入但没有 `/Odometry` | 静置等待 `IMU Initial Done`，再查时间戳、丢包和外参 |
+| `/Odometry` 延迟持续增长 | 用 `rostopic delay /Odometry` 确认趋势；检查是否加载 `airy.yaml` 的 `1/2/0.35/0.45` 低延迟参数、是否重复启动节点、点云发布是否误开启，以及 Orin 温度/降频和 CPU 负载 |
 | `/Odometry` 正常但 vision 为 0 Hz | 检查 `airy_px4.env`、启动输出中的发布门控和桥诊断 |
 | 串口不存在或无权限 | 核对 `FCU_URL`、设备节点和 `dialout`，重新登录后再试 |
 | `source timestamp gap` | 检查真实 `/Odometry` header 缺帧、UDP 缓冲和网络丢包 |
@@ -431,7 +452,7 @@ runtime/airy_px4/<时间_UAV_PID>/
 - [ ] `6699/7788/6688` 三路 UDP 都能抓到；
 - [ ] 一键安装完整通过，UDP 系统参数达到要求；
 - [ ] `check_airy_topics.sh` 一次性接口/时间自检通过，并另做持续频率检查；
-- [ ] `/Odometry` 和配准点云持续输出；
+- [ ] `/Odometry` 约 10 Hz 且 `rostopic delay` 不随运行时间持续增长；配准点云按需临时启用；
 - [ ] 飞控串口、MAVROS 连接和 timesync 正常；
 - [ ] 本机 `airy_px4.env` 已按这架飞机标定，未复制其他飞机的结果；
 - [ ] 只诊断测试通过；

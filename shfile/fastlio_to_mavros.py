@@ -189,6 +189,8 @@ class FastlioToMavrosBridge:
         self.fcu_imu_receive_time = None
         self.latest_odom = None
         self.latest_odom_receive_time = None
+        self.last_observed_source_stamp = None
+        self.rejected_source_count = 0
         self.last_source_stamp = None
         self.last_source_position = None
         self.last_source_rotation = None
@@ -209,7 +211,7 @@ class FastlioToMavrosBridge:
         self.gravity_mismatch_deg = float("nan")
 
         self.pose_publisher = rospy.Publisher(
-            self.output_topic, PoseStamped, queue_size=10
+            self.output_topic, PoseStamped, queue_size=1
         )
         self.diagnostic_publisher = rospy.Publisher(
             self.diagnostics_topic, DiagnosticArray, queue_size=10, latch=True
@@ -223,7 +225,7 @@ class FastlioToMavrosBridge:
         )
         rospy.Subscriber(self.sensor_imu_topic, Imu, self._sensor_imu_callback, queue_size=50)
         rospy.Subscriber(self.fcu_imu_topic, Imu, self._fcu_imu_callback, queue_size=50)
-        rospy.Subscriber(self.odom_topic, Odometry, self._odom_callback, queue_size=20)
+        rospy.Subscriber(self.odom_topic, Odometry, self._odom_callback, queue_size=1)
         self.timer = rospy.Timer(rospy.Duration(0.5), self._timer_callback)
 
         rospy.logwarn(
@@ -490,7 +492,17 @@ class FastlioToMavrosBridge:
         output.pose.orientation.y = float(quaternion[1])
         output.pose.orientation.z = float(quaternion[2])
         output.pose.orientation.w = float(quaternion[3])
-        self.pose_publisher.publish(output)
+        # Subscriber callbacks can overlap rospy teardown by a few milliseconds.
+        # Treat a closed publisher during shutdown as a normal stop, not a bridge
+        # fault or a noisy "bad callback" traceback.
+        if rospy.is_shutdown():
+            return
+        try:
+            self.pose_publisher.publish(output)
+        except rospy.ROSException:
+            if rospy.is_shutdown():
+                return
+            raise
         self.output_receipts.append(now_sec)
         self._trim_receipts(self.output_receipts, now_sec)
 
@@ -498,17 +510,25 @@ class FastlioToMavrosBridge:
         now = rospy.Time.now()
         now_sec = now.to_sec()
         with self.lock:
-            # A latched fault is restart-only by design.  Freeze the triggering
-            # gap and rejection details instead of letting every later source
-            # callback inflate them into a misleading multi-second value.
+            observed_stamp = float(message.header.stamp.to_sec())
+            self.last_observed_source_stamp = (
+                observed_stamp
+                if math.isfinite(observed_stamp) and observed_stamp > 0.0
+                else None
+            )
+            # A latched fault is restart-only by design.  Continue observing
+            # source timestamps for diagnostics, but freeze the triggering gap
+            # and rejection details.
             if self.latched_fault:
                 return
             try:
                 stamp, position, rotation = self._validate_odom(message, now)
             except RuntimeError as error:
+                self.rejected_source_count += 1
                 self._reject(str(error), latch=self.aligned)
                 return
             except ValueError as error:
+                self.rejected_source_count += 1
                 self._reject(str(error), latch=False)
                 return
 
@@ -617,6 +637,10 @@ class FastlioToMavrosBridge:
                 float("inf") if self.latest_odom_receive_time is None
                 else (now - self.latest_odom_receive_time).to_sec()
             )
+            source_stamp_age = (
+                float("inf") if self.last_observed_source_stamp is None
+                else now_sec - self.last_observed_source_stamp
+            )
             state = self.state
             timesync_rtt_ms = (
                 float("nan") if self.timesync is None
@@ -635,8 +659,18 @@ class FastlioToMavrosBridge:
                 "fcu_connected": bool(state and state.connected),
                 "fcu_armed": bool(state and state.armed),
                 "input_rate_hz": "{:.2f}".format(self._rate(self.source_receipts)),
+                # Historical input_age_s is the age of the most recent valid
+                # callback.  Keep it for compatibility and expose header age
+                # separately so an upstream FIFO backlog is unambiguous.
                 "output_rate_hz": "{:.2f}".format(self._rate(self.output_receipts)),
                 "input_age_s": "{:.3f}".format(source_age),
+                "input_receipt_age_s": "{:.3f}".format(source_age),
+                "source_stamp_age_s": (
+                    "unknown"
+                    if not math.isfinite(source_stamp_age)
+                    else "{:.3f}".format(source_stamp_age)
+                ),
+                "rejected_source_count": self.rejected_source_count,
                 "last_source_gap_s": "{:.3f}".format(self.last_source_gap_s),
                 "max_observed_source_gap_s": "{:.3f}".format(
                     self.max_observed_source_gap_s

@@ -3,6 +3,13 @@ common:
     imu_topic:  "/rslidar_imu_data"
     time_sync_en: false
     time_offset_lidar_to_imu: 0.0
+    # Flight mode is latest-data-first: never retain an unbounded history when
+    # Orin temporarily processes slower than the Airy's nominal 10 Hz.
+    lidar_sub_queue_size: 1
+    imu_sub_queue_size: 2000
+    max_lidar_buffer_size: 2
+    max_lidar_age_s: 0.35
+    max_odom_publish_age_s: 0.45
 
 preprocess:
     lidar_type: 5                # 5: RoboSense XYZIRT (Airy)
@@ -27,9 +34,12 @@ mapping:
 
 publish:
     path_en: false
-    scan_publish_en: true
-    dense_publish_en: true
-    scan_bodyframe_pub_en: true
+    # Registered clouds cost two full point transforms plus two serializations
+    # per frame.  They are disabled for onboard flight; enable temporarily only
+    # for a ground/RViz debugging session.
+    scan_publish_en: false
+    dense_publish_en: false
+    scan_bodyframe_pub_en: false
 
 pcd_save:
     pcd_save_en: false

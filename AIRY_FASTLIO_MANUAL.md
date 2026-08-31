@@ -72,8 +72,8 @@ Airy UDP 6699/7788/6688
           ▼
   /laserMapping
     ├─ /Odometry                nav_msgs/Odometry
-    ├─ /cloud_registered        世界系配准点云
-    ├─ /cloud_registered_body   Airy 内部 IMU 系点云
+    ├─ /cloud_registered        世界系配准点云（飞行配置默认关闭）
+    ├─ /cloud_registered_body   Airy 内部 IMU 系点云（默认关闭）
     ├─ /path                    仅 path_en=true 时发布
     └─ TF camera_init -> body
           │
@@ -101,7 +101,7 @@ Airy UDP 6699/7788/6688
 | `/rslidar_points` | `sensor_msgs/PointCloud2` | 约 10 Hz | 必须包含 `x/y/z/intensity/ring/timestamp` |
 | `/rslidar_imu_data` | `sensor_msgs/Imu` | 约 200 Hz | Airy 内部 IMU |
 | `/Odometry` | `nav_msgs/Odometry` | 约 10 Hz | pose/pose covariance 有效；`twist` 未填，默认零且不能当速度 |
-| `/cloud_registered` | `sensor_msgs/PointCloud2` | 约 10 Hz | FAST-LIO 局部世界系中的点云 |
+| `/cloud_registered` | `sensor_msgs/PointCloud2` | 默认 0 Hz | FAST-LIO 局部世界系中的点云；仅地面/RViz 调试时临时启用 |
 | `/<UAV>/mavros/vision_pose/pose` | `geometry_msgs/PoseStamped` | 约 10 Hz | 桥接成功时给 MAVROS 的输入 |
 | `/<UAV>/mavros/local_position/pose` | `geometry_msgs/PoseStamped` | 由 PX4/MAVROS 决定 | PX4 估计结果的间接观察，不是原输入回显 |
 
@@ -428,9 +428,10 @@ bash shfile/install_fastlio2_Airy.sh --build-only --online-only --jobs 2
 `build/noetic-arm64-airy/devel/`，驱动 overlay 位于
 `environment/rslidar_ws/devel/noetic-arm64/`。
 
-`CMakeLists.txt` 当前在 x86 上根据 CPU 数启用 2～3 个匹配线程，非 x86 使用单线程
-匹配路径。这是 Orin 性能二次优化的重要入口，但修改后必须用固定 rosbag 做精度和
-延迟回归，不能只看 CPU 占用。
+`CMakeLists.txt` 现在在多核 x86 和 ARM 上启用 OpenMP 匹配路径；Orin 默认为 3 个
+匹配线程（`MP_PROC_NUM=3`）。线程数可在重新配置构建时通过
+`FAST_LIO_MP_THREADS` 调整，但修改后必须用固定 rosbag 做精度、CPU 和端到端延迟
+回归，不能只看平均帧率。
 
 ### 5.4 环境加载
 
@@ -506,9 +507,23 @@ roslaunch fast_lio mapping_airy.launch rviz:=true
 `Ctrl+C` 后再执行下一条：
 
 ```bash
-rostopic hz /Odometry /cloud_registered
+rostopic hz /rslidar_points /rslidar_imu_data /Odometry
+rostopic delay /Odometry
 rostopic echo -n 1 /Odometry
 ```
+
+飞行配置默认不发布两路注册点云。如果只为地面观察，可临时运行：
+
+```bash
+roslaunch fast_lio mapping_airy.launch rviz:=true publish_clouds:=true
+```
+
+按需再加 `dense_cloud:=true` 或 `publish_body_cloud:=true`。这些 launch 参数不修改
+`config/airy.yaml`，下一次普通启动会自动恢复飞行默认值。
+
+本次低延迟修复后的短时台架实测为：点云约 10 Hz、IMU 约 200 Hz、
+`/Odometry` 约 10 Hz，header 到本机接收的延迟约 6～29 ms。这只是本次短测
+的实时性检查，不是长时运行、定位精度、PX4 融合或装桨飞行验收。
 
 若驱动已由别处启动或正在回放 bag：
 
@@ -546,7 +561,8 @@ Airy 主线每帧执行：
 1. `rslidar_sdk_node` 发布 XYZIRT 点云和内置 IMU。
 2. `Preprocess` 的 Airy handler 读取逐点时间，以时间戳最早的有效点为扫描起点，转换为毫秒
    偏移并在必要时按时间排序；异常点、盲区点和明显异常的扫描偏移会被剔除。
-3. `laserMapping.cpp` 缓存点云和 IMU，等待 IMU 覆盖扫描末端后组成一个测量组。
+3. `laserMapping.cpp` 以有界队列缓存点云和 IMU，等待 IMU 覆盖扫描末端后组成
+   测量组；过载时保留已组帧的前端和最新待处理帧，而不是无界累积旧数据。
 4. `IMU_Processing.hpp` 完成初始重力/偏置估计、状态传播和逐点去畸变。
 5. 当前帧体素降采样，在 ikd-Tree 中寻找近邻并拟合局部平面。
 6. 以点到平面残差构建观测，IKFoM 迭代更新位置、姿态、速度、IMU 偏置、重力和可选
@@ -609,7 +625,7 @@ Airy 主线每帧执行：
 | `ts_first_point` | `true` | header/时间以首点为基准 |
 | `wait_for_difop` | `true` | 收到 DIFOP 后正常输出 |
 | `ros_frame_id` | `rslidar` | 点云和 Airy IMU 的消息 frame 字符串 |
-| `ros_queue_length` | `100` | 当前 ROS1 路径不读取；点云/IMU 发布队列源码固定为 `10/1000` |
+| `ros_queue_length` | `1` | ROS1 `PointCloud2` 发布队列会读取此值，只保留最新待发送扫描；IMU 发布队列仍为独立源码配置 |
 
 修改驱动话题后，必须同步修改 FAST-LIO 的 `lid_topic` 和 `imu_topic`。改变点型或 IMU
 解析宏需要重新构建，不是重启 launch 就能生效。`ros_frame_id` 只是消息标识，不会把
@@ -623,6 +639,11 @@ LiDAR 数值自动旋转到内部 IMU 或飞机坐标系，也不能替代 §2 �
 | --- | ---: | --- |
 | `common/lid_topic` | `/rslidar_points` | 点云输入 |
 | `common/imu_topic` | `/rslidar_imu_data` | Airy 内置 IMU 输入 |
+| `common/lidar_sub_queue_size` | `1` | ROS 点云订阅只保留最新回调数据 |
+| `common/imu_sub_queue_size` | `2000` | IMU 订阅队列；不能像点云一样随意丢时序样本 |
+| `common/max_lidar_buffer_size` | `2` | FAST-LIO 内部最多保留 2 帧点云 |
+| `common/max_lidar_age_s` | `0.35 s` | 未组帧的旧点云超过该年龄时丢弃 |
+| `common/max_odom_publish_age_s` | `0.45 s` | 计算结果过期时不再发布 `/Odometry` |
 | `time_sync_en` | `false` | Airy PointCloud2 路径不实现自动偏移估计，设 true 也不会自动校时 |
 | `time_offset_lidar_to_imu` | `0.0` | 代码执行 `imu_stamp=raw_imu_stamp-offset`；仅经测量后调整 |
 | `lidar_type` | `5` | Airy handler |
@@ -635,16 +656,20 @@ LiDAR 数值自动旋转到内部 IMU 或飞机坐标系，也不能替代 §2 �
 | `extrinsic_est_en` | `true` | 在线细化内部外参，不会自动写回 YAML |
 | `extrinsic_T/R` | 设备标称初值 | `p_I=R_IL p_L+t_IL`，正式部署应核对本机标定 |
 
-发布项：
+发布项（当前飞行默认）：
 
 - `path_en=false`：不累积 `/path`；
-- `scan_publish_en=true`：发布 `/cloud_registered`；
-- `dense_publish_en=true`：发布稠密注册点云；
-- `scan_bodyframe_pub_en=true`：发布 `/cloud_registered_body`；
+- `scan_publish_en=false`：不发布 `/cloud_registered`；
+- `dense_publish_en=false`：若临时启用注册点云，默认仍不选稠密输出；
+- `scan_bodyframe_pub_en=false`：不发布 `/cloud_registered_body`；
 - `pcd_save_en=false`：默认不保存 PCD；
 - `interval=-1`：若启用 PCD 会一直累计，长时间运行有内存风险。
 
 板端减负首先考虑关闭不需要的注册点云和 body 点云，而不是削弱状态估计输入。
+
+除了上述点云入口，FAST-LIO 的 `/Odometry` 发布队列、Python 桥的里程计输入与视觉输出
+队列，以及监控器的源/视觉输入队列均为 `1`。因此端到端非 IMU 位姿链使用 latest-only
+策略；IMU 队列仍保留较深缓冲，以维持去畸变和状态传播所需的连续时序。
 
 ### 8.3 Launch 参数
 
@@ -654,11 +679,14 @@ LiDAR 数值自动旋转到内部 IMU 或飞机坐标系，也不能替代 §2 �
 | --- | ---: | --- |
 | `start_driver` | `true` | 是否包含 Airy 驱动 |
 | `rviz` | `false` | 板端默认不启 RViz |
-| `point_filter_num` | `3` | 越大保留点越少，CPU 降低但细节减少 |
+| `publish_clouds` | `false` | 临时发布世界系注册点云；仅地面调试启用 |
+| `dense_cloud` | `false` | 注册点云使用未降采样数据，负载较高 |
+| `publish_body_cloud` | `false` | 临时发布 Airy IMU/body 系点云 |
+| `point_filter_num` | `4` | 越大保留点越少，CPU 降低但细节减少 |
 | `max_iteration` | `3` | 每帧滤波迭代上限 |
-| `filter_size_surf` | `0.3` m | 当前帧体素尺寸 |
-| `filter_size_map` | `0.4` m | 地图体素尺寸 |
-| `cube_side_length` | `500` m | 局部地图立方体尺度 |
+| `filter_size_surf` | `0.4` m | 当前帧体素尺寸 |
+| `filter_size_map` | `0.5` m | 地图体素尺寸 |
+| `cube_side_length` | `300` m | 局部地图立方体尺度 |
 | `feature_extract_enable` | `false` | Airy 主线必须保持直接点模式 |
 | `runtime_pos_log_enable` | `false` | 默认不写位置运行日志 |
 
@@ -1084,6 +1112,9 @@ rosbag record -O airy_full.bag \
   /cloud_registered
 ```
 
+当前飞行配置下 `/cloud_registered` 默认无消息；只有临时启用注册点云发布时才需要把它
+加入回归包。定位输入和 `/Odometry` 的记录不受此开关影响。
+
 回放：
 
 ```bash
@@ -1137,10 +1168,17 @@ top
 free -h
 ip -s link
 rostopic hz /rslidar_points /rslidar_imu_data /Odometry
+rostopic delay /Odometry
 ```
 
 Jetson 还应观察温度、功耗模式和降频。性能优化必须同时报告轨迹质量、点云重影、端到
 端延迟、丢包、CPU、内存和温度，不能只报告平均帧率。
+
+`rostopic delay` 应在同一主机时间轴下观察趋势。若 `/Odometry` 延迟随运行时间单调
+增长，而不是在几十毫秒内抖动，依次检查：运行参数是否仍为点云订阅 `1`、内部帧缓冲
+`2`、旧帧阈值 `0.35 s`、过期里程计阈值 `0.45 s`；是否重复启动驱动或
+`/laserMapping`；注册/body/稠密点云是否误开启；Orin 是否过热降频或 CPU 饱和；网卡
+丢包与系统时钟是否异常。不要增加 ROS 队列或放宽桥的源年龄门来隐藏积压。
 
 ## 13. 验收矩阵
 
@@ -1186,6 +1224,7 @@ Jetson 还应观察温度、功耗模式和降频。性能优化必须同时报�
 | 缺 `ring/timestamp` | 驱动不是 XYZIRT | 检查 CMake cache，重建驱动 |
 | 时间与 ROS 相差巨大 | 错用设备开机相对时钟 | 保持 `use_lidar_clock=false` |
 | `/Odometry` 不输出 | IMU 未初始化、输入断流/不同步 | 静置，检查话题时间覆盖 |
+| `/Odometry` 延迟持续增长 | 旧扫描排队、重复节点、点云序列化或 Orin 降频/过载 | `rostopic delay /Odometry`，核对有界队列和发布开关，再查 CPU/温度/网络 |
 | 点云重影/墙面分层 | 逐点时间、丢包或 `L -> I` 外参错误 | 按时间、网络、外参顺序排查 |
 | `/Odometry` 有而 vision 0 Hz | 发布未请求或安全门未通过 | 看启动总结和 bridge 日志 |
 | AID mask 为 24 仍被阻断 | 包含 EV yaw 但未许可 | 标定航向后授权，或使用不含 yaw 的方案 |
@@ -1325,7 +1364,7 @@ git diff -- README.md AIRY_FASTLIO_MANUAL.md shfile/README.md
 
 ### 16.1 已验证基线
 
-截至 2026-08-28，本项目在 Jetson Orin、Ubuntu 20.04、ROS Noetic、Airy 和 PX4
+截至 2026-08-31，本项目在 Jetson Orin、Ubuntu 20.04、ROS Noetic、Airy 和 PX4
 1.13.3 的台架链路上完成过：
 
 - 三路 UDP、XYZIRT 点云、Airy IMU 和 FAST-LIO 输出验证；
@@ -1336,7 +1375,9 @@ git diff -- README.md AIRY_FASTLIO_MANUAL.md shfile/README.md
 
 当前模板安全默认仍为禁发。历史台架使用过近似安装方向和零杆臂来跑通流程，这类值只
 属于本机私有实验，不是通用标定，也不写入本手册。已观察到的真实外部位姿频率约
-10 Hz，低于项目 30 Hz 飞行门槛；POSCTL 被接受也没有替代 ULog/uORB 融合证明。
+10 Hz，低于项目 30 Hz 飞行门槛；本次低延迟修复后的短测中，点云约 10 Hz、IMU 约
+200 Hz、`/Odometry` 约 10 Hz，里程计 header 延迟约 6～29 ms。短测不是长期运行或
+飞行验收；POSCTL 被接受也没有替代 ULog/uORB 融合证明。
 
 ### 16.2 已知工程限制
 
@@ -1347,7 +1388,7 @@ git diff -- README.md AIRY_FASTLIO_MANUAL.md shfile/README.md
 - 监控无法独立证明 EV 融合；
 - 单 ROS master 只支持一套全局命名的 Airy/PX4 栈；
 - Airy 主线不使用 ring 做匹配，也不支持传统特征提取；
-- Orin 当前 CMake 匹配线程策略偏保守；
+- Orin 默认使用 3 个 OpenMP 匹配线程，仍需按功耗模式、温度和实际场景做长时回归；
 - Livox 脚本是独立旧链路，不属于 Airy + PX4 综合启动；
 - `package.xml` 保留了上游 BSD/Livox 元数据，与 Airy 的可选构建和根许可证声明存在
   历史差异，分发前应由项目维护者做一次正式许可证清点。

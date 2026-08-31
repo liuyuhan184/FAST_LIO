@@ -233,11 +233,15 @@ inline void DestinationPointCloudRos::init(const YAML::Node& config)
   std::string ros_send_topic;
   yamlRead<std::string>(config["ros"], 
       "ros_send_point_cloud_topic", ros_send_topic, "rslidar_points");
-
-
+  size_t ros_queue_length;
+  yamlRead<size_t>(config["ros"], "ros_queue_length", ros_queue_length, 10);
+  if (ros_queue_length == 0)
+  {
+    ros_queue_length = 1;
+  }
 
   nh_ = std::unique_ptr<ros::NodeHandle>(new ros::NodeHandle());
-  pub_ = nh_->advertise<sensor_msgs::PointCloud2>(ros_send_topic, 10);
+  pub_ = nh_->advertise<sensor_msgs::PointCloud2>(ros_send_topic, ros_queue_length);
 #ifdef ENABLE_IMU_DATA_PARSE
   std::string ros_send_imu_data_topic;
   yamlRead<std::string>(config["ros"], 
@@ -498,4 +502,3 @@ inline void DestinationPointCloudRos::sendImuData(const std::shared_ptr<ImuData>
 }  // namespace robosense
 
 #endif
-
