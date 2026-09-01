@@ -13,7 +13,9 @@ lidar:
       group_address: 0.0.0.0
       user_layer_bytes: 0
       tail_layer_bytes: 0
-      min_distance: 0.2
+      # Match FAST-LIO preprocess/blind so discarded near returns never enter
+      # the point-cloud allocation and ROS serialization path.
+      min_distance: 0.5
       max_distance: 60.0
       # This Airy currently reports a device-uptime clock rather than Unix/UTC.
       # Use host receive time so ROS, MAVROS and PX4 share one epoch.  Set true

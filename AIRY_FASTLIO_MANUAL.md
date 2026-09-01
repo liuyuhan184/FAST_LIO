@@ -618,7 +618,7 @@ Airy 主线每帧执行：
 | `imu_port` | `6688` | 内置 IMU 端口 |
 | `host_address` | `0.0.0.0` | 在本机可用接口接收 |
 | `group_address` | `0.0.0.0` | 当前单播配置 |
-| `min_distance` | `0.2` m | 驱动近距离裁剪 |
+| `min_distance` | `0.5` m | 与 FAST-LIO `blind` 对齐，避免传输最终必丢的近点 |
 | `max_distance` | `60.0` m | 驱动远距离裁剪 |
 | `use_lidar_clock` | `false` | 当前必须用主机时间 |
 | `dense_points` | `true` | 输出稠密点 |
@@ -682,16 +682,29 @@ LiDAR 数值自动旋转到内部 IMU 或飞机坐标系，也不能替代 §2 �
 | `publish_clouds` | `false` | 临时发布世界系注册点云；仅地面调试启用 |
 | `dense_cloud` | `false` | 注册点云使用未降采样数据，负载较高 |
 | `publish_body_cloud` | `false` | 临时发布 Airy IMU/body 系点云 |
-| `point_filter_num` | `4` | 越大保留点越少，CPU 降低但细节减少 |
+| `point_filter_num` | `5` | 精度优先低负载默认档；稀疏场景可用 launch 参数切回 `4` |
 | `max_iteration` | `3` | 每帧滤波迭代上限 |
 | `filter_size_surf` | `0.4` m | 当前帧体素尺寸 |
 | `filter_size_map` | `0.5` m | 地图体素尺寸 |
 | `cube_side_length` | `300` m | 局部地图立方体尺度 |
+| `main_loop_rate_hz` | `1000` Hz | 回调/同步轮询频率；Airy 10 Hz、IMU 约 200 Hz，无需原来的 5 kHz 空转 |
 | `feature_extract_enable` | `false` | Airy 主线必须保持直接点模式 |
-| `runtime_pos_log_enable` | `false` | 默认不写位置运行日志 |
+| `runtime_pos_log_enable` | `false` | 默认不创建/刷新调试矩阵文件，也不分配大容量计时数组 |
 
-Orin 负载高时，可从增加 `point_filter_num`、`filter_size_surf`、`filter_size_map` 和关闭
-点云发布开始。每次只改一类参数，用同一个 bag 比较轨迹、重影、延迟、CPU 和内存。
+当前版本先做了不改变估计数学的减负：Airy 预处理直接遍历 ROS 消息、ikd-tree 小近邻堆
+和结果缓存复用、无时间偏移时不深拷贝 200 Hz IMU、移除飞行模式逐帧日志刷新、按需分配
+调试计时数组，并清除若干未使用的大对象。默认算法档只把点抽样由每 `4` 个保留一个
+温和改为每 `5` 个保留一个，其余迭代、体素、视场、量程和在线外参均保持。
+
+特别稀疏、长走廊或快速大角速度场景可先恢复更多点：
+
+```bash
+roslaunch fast_lio mapping_airy.launch point_filter_num:=4
+```
+
+若仍需继续减负，可再逐项增加 `point_filter_num`、`filter_size_surf` 或
+`filter_size_map`；不要同时降低迭代次数、裁视场和关闭在线外参。每次只改一类参数，用
+同一个 bag 比较轨迹、重影、延迟、CPU 和内存，动态精度验收通过后才能用于飞行。
 
 ### 8.4 本机飞机配置
 

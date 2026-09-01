@@ -228,9 +228,10 @@ rostopic hz /rslidar_points /rslidar_imu_data /Odometry
 rostopic delay /Odometry
 ```
 
-本次修复后的短时台架实测为：点云约 10 Hz、IMU 约 200 Hz、`/Odometry` 约 10 Hz，
-`rostopic delay /Odometry` 约 6～29 ms。这个数字只说明本次短测没有继续积压，不是长期
-稳定性、定位精度或装桨飞行验收。场景点数会变化，不能仅按固定点数判断故障。
+本次低负载版本的短时台架实测为：点云约 10 Hz、IMU 约 200 Hz、`/Odometry` 约
+10 Hz；连续 100 条里程计的消息年龄平均约 20 ms、P95 约 24 ms、最大约 27 ms。
+这个数字只说明本次静态短测没有继续积压，不是长期稳定性、动态定位精度或装桨飞行
+验收。场景点数会变化，不能仅按固定点数判断故障。
 
 当前低延迟配置采用“新数据优先”：Airy 的 ROS1 点云发布队列读取
 `ros_queue_length=1`；FAST-LIO 点云订阅队列为 `1`、内部点云帧缓冲上限为 `2`，主动
@@ -238,6 +239,19 @@ rostopic delay /Odometry
 在 Orin 短时过载时丢旧帧，避免把几十秒前的轨迹继续送给飞控。FAST-LIO 里程计发布、
 Python 桥的里程计输入/视觉输出以及监控器的源/视觉输入队列也都是 `1`，因此整条非 IMU
 位姿链路采用 latest-only 策略。
+
+当前 Orin 默认档在不降低 10 Hz 雷达/里程计频率、不减少 3 次滤波迭代、保持 360°
+视场和 60 m 距离的前提下，将 `point_filter_num` 从 `4` 温和调整为 `5`。若飞行场景
+纹理特别稀疏，可临时切回保留更多点的配置：
+
+```bash
+roslaunch fast_lio mapping_airy.launch point_filter_num:=4
+```
+
+源码还会复用 ikd-tree 近邻查询缓存、直接读取 Airy `PointCloud2`、在无需校时时复用 IMU
+消息，并把无数据主循环从 5 kHz 降为 1 kHz。`runtime_pos_log_enable=false` 时不会创建或
+逐帧刷新调试矩阵文件；大容量计时数组也只在显式开启运行日志后分配。这些改动不改变
+滤波观测模型或坐标变换。
 
 验收完成后在这个 `roslaunch` 终端按一次 `Ctrl+C`，确认 `/laserMapping` 和
 `/rslidar_sdk_node` 已退出，再继续飞机综合部署；否则综合启动器会拒绝重复节点。

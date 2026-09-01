@@ -2,10 +2,177 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <string>
 
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
+
+namespace
+{
+struct RoboSenseFieldOffsets
+{
+  std::size_t x;
+  std::size_t y;
+  std::size_t z;
+  std::size_t intensity;
+  std::size_t ring;
+  std::size_t timestamp;
+};
+
+bool checked_size_multiply(std::size_t lhs, std::size_t rhs, std::size_t &result)
+{
+  if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs)
+  {
+    return false;
+  }
+  result = lhs * rhs;
+  return true;
+}
+
+bool checked_size_add(std::size_t lhs, std::size_t rhs, std::size_t &result)
+{
+  if (rhs > std::numeric_limits<std::size_t>::max() - lhs)
+  {
+    return false;
+  }
+  result = lhs + rhs;
+  return true;
+}
+
+bool host_is_big_endian()
+{
+  const std::uint16_t marker = 0x0102;
+  return *(reinterpret_cast<const std::uint8_t *>(&marker)) == 0x01;
+}
+
+bool validate_robosense_field(const sensor_msgs::PointCloud2 &msg,
+                              const char *name,
+                              std::uint8_t expected_datatype,
+                              std::size_t field_size,
+                              std::size_t &offset,
+                              std::string &error)
+{
+  const sensor_msgs::PointField *matched = nullptr;
+  for (const auto &field : msg.fields)
+  {
+    if (field.name != name)
+    {
+      continue;
+    }
+    if (matched != nullptr)
+    {
+      error = std::string("duplicate field '") + name + "'";
+      return false;
+    }
+    matched = &field;
+  }
+
+  if (matched == nullptr)
+  {
+    error = std::string("missing field '") + name + "'";
+    return false;
+  }
+  if (matched->datatype != expected_datatype || matched->count != 1)
+  {
+    error = std::string("field '") + name + "' has an unexpected datatype or count";
+    return false;
+  }
+
+  const std::size_t point_step = static_cast<std::size_t>(msg.point_step);
+  const std::size_t field_offset = static_cast<std::size_t>(matched->offset);
+  if (field_offset > point_step || field_size > point_step - field_offset)
+  {
+    error = std::string("field '") + name + "' exceeds point_step";
+    return false;
+  }
+  offset = field_offset;
+  return true;
+}
+
+bool validate_robosense_layout(const sensor_msgs::PointCloud2 &msg,
+                               RoboSenseFieldOffsets &offsets,
+                               std::size_t &point_count,
+                               std::string &error)
+{
+  if (!checked_size_multiply(static_cast<std::size_t>(msg.width),
+                             static_cast<std::size_t>(msg.height), point_count))
+  {
+    error = "width * height overflows size_t";
+    return false;
+  }
+  if (point_count == 0)
+  {
+    return true;
+  }
+
+  if (msg.is_bigendian != host_is_big_endian())
+  {
+    error = "message endianness differs from the host";
+    return false;
+  }
+  if (msg.point_step == 0)
+  {
+    error = "point_step is zero";
+    return false;
+  }
+
+  std::size_t packed_row_size = 0;
+  if (!checked_size_multiply(static_cast<std::size_t>(msg.width),
+                             static_cast<std::size_t>(msg.point_step), packed_row_size))
+  {
+    error = "width * point_step overflows size_t";
+    return false;
+  }
+  if (static_cast<std::size_t>(msg.row_step) < packed_row_size)
+  {
+    error = "row_step is smaller than width * point_step";
+    return false;
+  }
+
+  std::size_t preceding_rows_size = 0;
+  const std::size_t preceding_rows = static_cast<std::size_t>(msg.height - 1);
+  if (!checked_size_multiply(preceding_rows, static_cast<std::size_t>(msg.row_step),
+                             preceding_rows_size))
+  {
+    error = "row layout overflows size_t";
+    return false;
+  }
+  std::size_t required_data_size = 0;
+  if (!checked_size_add(preceding_rows_size, packed_row_size, required_data_size))
+  {
+    error = "required point-cloud data size overflows size_t";
+    return false;
+  }
+  if (msg.data.size() < required_data_size)
+  {
+    error = "data buffer is shorter than the declared row layout";
+    return false;
+  }
+
+  return validate_robosense_field(msg, "x", sensor_msgs::PointField::FLOAT32,
+                                  sizeof(float), offsets.x, error) &&
+         validate_robosense_field(msg, "y", sensor_msgs::PointField::FLOAT32,
+                                  sizeof(float), offsets.y, error) &&
+         validate_robosense_field(msg, "z", sensor_msgs::PointField::FLOAT32,
+                                  sizeof(float), offsets.z, error) &&
+         validate_robosense_field(msg, "intensity", sensor_msgs::PointField::FLOAT32,
+                                  sizeof(float), offsets.intensity, error) &&
+         validate_robosense_field(msg, "ring", sensor_msgs::PointField::UINT16,
+                                  sizeof(std::uint16_t), offsets.ring, error) &&
+         validate_robosense_field(msg, "timestamp", sensor_msgs::PointField::FLOAT64,
+                                  sizeof(double), offsets.timestamp, error);
+}
+
+template <typename T>
+T read_point_field(const std::uint8_t *point_data, std::size_t offset)
+{
+  T value;
+  std::memcpy(&value, point_data + offset, sizeof(T));
+  return value;
+}
+}  // namespace
 
 Preprocess::Preprocess()
   :lidar_type(AVIA), point_filter_num(1), blind(0.01), scan_start_time(0.0), feature_enabled(0)
@@ -205,21 +372,38 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<robosense_ros::Point> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  if (pl_orig.empty())
+  RoboSenseFieldOffsets field_offsets{};
+  std::size_t point_count = 0;
+  std::string layout_error;
+  if (!validate_robosense_layout(*msg, field_offsets, point_count, layout_error))
+  {
+    ROS_ERROR_THROTTLE(5.0, "Invalid RoboSense XYZIRT PointCloud2: %s", layout_error.c_str());
+    return;
+  }
+  if (point_count == 0 || msg->data.empty())
   {
     ROS_WARN_THROTTLE(5.0, "Received an empty RoboSense point cloud.");
     return;
   }
 
   double first_point_time = std::numeric_limits<double>::infinity();
-  for (const auto &point : pl_orig.points)
+  for (std::size_t row = 0; row < static_cast<std::size_t>(msg->height); ++row)
   {
-    if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z) &&
-        std::isfinite(point.timestamp) && point.timestamp > 0.0)
+    const std::uint8_t *row_data =
+        msg->data.data() + row * static_cast<std::size_t>(msg->row_step);
+    for (std::size_t col = 0; col < static_cast<std::size_t>(msg->width); ++col)
     {
-      first_point_time = std::min(first_point_time, point.timestamp);
+      const std::uint8_t *point_data =
+          row_data + col * static_cast<std::size_t>(msg->point_step);
+      const float x = read_point_field<float>(point_data, field_offsets.x);
+      const float y = read_point_field<float>(point_data, field_offsets.y);
+      const float z = read_point_field<float>(point_data, field_offsets.z);
+      const double timestamp = read_point_field<double>(point_data, field_offsets.timestamp);
+      if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+          std::isfinite(timestamp) && timestamp > 0.0)
+      {
+        first_point_time = std::min(first_point_time, timestamp);
+      }
     }
   }
 
@@ -244,52 +428,65 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
         "Feature extraction is not supported for RoboSense Airy; using FAST-LIO2 direct raw-point mode.");
   }
 
-  pl_surf.reserve(pl_orig.size() / std::max(point_filter_num, 1) + 1);
+  const int filter_num = std::max(point_filter_num, 1);
+  pl_surf.reserve(point_count / filter_num + 1);
   bool timestamps_monotonic = true;
   double previous_offset_ms = -1.0;
   int valid_index = 0;
 
-  for (const auto &point : pl_orig.points)
+  for (std::size_t row = 0; row < static_cast<std::size_t>(msg->height); ++row)
   {
-    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
-        !std::isfinite(point.timestamp) || point.timestamp <= 0.0)
+    const std::uint8_t *row_data =
+        msg->data.data() + row * static_cast<std::size_t>(msg->row_step);
+    for (std::size_t col = 0; col < static_cast<std::size_t>(msg->width); ++col)
     {
-      continue;
-    }
+      const std::uint8_t *point_data =
+          row_data + col * static_cast<std::size_t>(msg->point_step);
+      const float x = read_point_field<float>(point_data, field_offsets.x);
+      const float y = read_point_field<float>(point_data, field_offsets.y);
+      const float z = read_point_field<float>(point_data, field_offsets.z);
+      const float intensity = read_point_field<float>(point_data, field_offsets.intensity);
+      const double timestamp = read_point_field<double>(point_data, field_offsets.timestamp);
+      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+          !std::isfinite(timestamp) || timestamp <= 0.0)
+      {
+        continue;
+      }
 
-    const double range_sq = point.x * point.x + point.y * point.y + point.z * point.z;
-    if (range_sq <= blind * blind)
-    {
-      continue;
-    }
+      const double range_sq = x * x + y * y + z * z;
+      if (range_sq <= blind * blind)
+      {
+        continue;
+      }
 
-    const double offset_ms = (point.timestamp - first_point_time) * 1000.0;
-    // A normal Airy frame is far below one second. This guard prevents an invalid
-    // absolute timestamp from corrupting FAST-LIO's motion compensation interval.
-    if (offset_ms < -1e-3 || offset_ms > 1000.0)
-    {
-      ROS_WARN_THROTTLE(5.0, "Ignoring RoboSense point with invalid time offset %.3f ms.", offset_ms);
-      continue;
-    }
+      const double offset_ms = (timestamp - first_point_time) * 1000.0;
+      // A normal Airy frame is far below one second. This guard prevents an invalid
+      // absolute timestamp from corrupting FAST-LIO's motion compensation interval.
+      if (offset_ms < -1e-3 || offset_ms > 1000.0)
+      {
+        ROS_WARN_THROTTLE(5.0, "Ignoring RoboSense point with invalid time offset %.3f ms.", offset_ms);
+        continue;
+      }
 
-    ++valid_index;
-    if (valid_index % std::max(point_filter_num, 1) != 0)
-    {
-      continue;
-    }
+      ++valid_index;
+      if (valid_index % filter_num != 0)
+      {
+        continue;
+      }
 
-    PointType added_pt;
-    added_pt.x = point.x;
-    added_pt.y = point.y;
-    added_pt.z = point.z;
-    added_pt.intensity = point.intensity;
-    added_pt.normal_x = 0.0f;
-    added_pt.normal_y = 0.0f;
-    added_pt.normal_z = 0.0f;
-    added_pt.curvature = static_cast<float>(offset_ms);
-    timestamps_monotonic = timestamps_monotonic && offset_ms >= previous_offset_ms;
-    previous_offset_ms = offset_ms;
-    pl_surf.push_back(added_pt);
+      PointType added_pt;
+      added_pt.x = x;
+      added_pt.y = y;
+      added_pt.z = z;
+      added_pt.intensity = intensity;
+      added_pt.normal_x = 0.0f;
+      added_pt.normal_y = 0.0f;
+      added_pt.normal_z = 0.0f;
+      added_pt.curvature = static_cast<float>(offset_ms);
+      timestamps_monotonic = timestamps_monotonic && offset_ms >= previous_offset_ms;
+      previous_offset_ms = offset_ms;
+      pl_surf.push_back(added_pt);
+    }
   }
 
   if (!timestamps_monotonic)

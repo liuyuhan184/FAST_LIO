@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <algorithm>
+#include <memory>
 #include <memory.h>
 #include <pcl/point_types.h>
 
@@ -112,18 +113,23 @@ public:
     {
 
     public:
-        MANUAL_HEAP(int max_capacity = 100)
-
+        explicit MANUAL_HEAP(int max_capacity = 100)
+            : heap(nullptr), heap_size(0), cap(max(max_capacity, 0))
         {
-            cap = max_capacity;
-            heap = new PointType_CMP[max_capacity];
-            heap_size = 0;
+            if (cap <= INLINE_CAPACITY)
+            {
+                heap = inline_heap;
+            }
+            else
+            {
+                fallback_heap.reset(new PointType_CMP[cap]);
+                heap = fallback_heap.get();
+            }
         }
 
-        ~MANUAL_HEAP()
-        {
-            delete[] heap;
-        }
+        MANUAL_HEAP(const MANUAL_HEAP &) = delete;
+        MANUAL_HEAP &operator=(const MANUAL_HEAP &) = delete;
+        ~MANUAL_HEAP() = default;
         void pop()
         {
             if (heap_size == 0)
@@ -157,6 +163,9 @@ public:
         }
 
     private:
+        static constexpr int INLINE_CAPACITY = 16;
+        PointType_CMP inline_heap[INLINE_CAPACITY];
+        std::unique_ptr<PointType_CMP[]> fallback_heap;
         PointType_CMP *heap;
         void MoveDown(int heap_index)
         {
@@ -334,6 +343,7 @@ public:
     int Delete_Point_Boxes(vector<BoxPointType> &BoxPoints);
     void flatten(KD_TREE_NODE *root, PointVector &Storage, delete_point_storage_set storage_type);
     void acquire_removed_points(PointVector &removed_points);
+    void clear_removed_points();
     BoxPointType tree_range();
     PointVector PCL_Storage;
     KD_TREE_NODE *Root_Node = nullptr;

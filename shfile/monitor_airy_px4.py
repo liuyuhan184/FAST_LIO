@@ -56,6 +56,8 @@ class Stream:
 
 
 class AiryPx4Monitor:
+    LOG_HEARTBEAT_SECONDS = 30.0
+
     def __init__(self):
         self.lock = threading.RLock()
         self.uav_name = rospy.get_param("~uav_name", "liu").strip("/")
@@ -118,7 +120,8 @@ class AiryPx4Monitor:
         self.recent_fcu_fault = ""
         self.recent_fcu_fault_time = None
         self.position_mode_accepted_once = False
-        self.last_summary = ""
+        self.last_semantic_state = None
+        self.last_log_time = None
 
         self.publisher = rospy.Publisher(
             self.output_topic, DiagnosticArray, queue_size=10, latch=True
@@ -565,14 +568,40 @@ class AiryPx4Monitor:
                 values["vision_rate_hz"],
                 values["bridge_state"],
             )
-            if compact != self.last_summary:
+            # Rates and message ages naturally fluctuate on every 1 Hz timer
+            # tick.  They remain visible in the diagnostic topic and in each
+            # periodic heartbeat, but must not turn a stable state into a
+            # once-per-second log stream.  Log immediately when a safety- or
+            # readiness-relevant semantic value changes, then at most once per
+            # heartbeat interval while that state remains stable.
+            semantic_state = (
+                level,
+                summary,
+                values["blocking_reasons"],
+                values["fcu_connected"],
+                values["fcu_armed"],
+                values["fcu_mode"],
+                values["bridge_state"],
+                values["position_mode_acceptance_verified"],
+                values["recent_px4_fault"],
+            )
+            state_changed = semantic_state != self.last_semantic_state
+            if self.last_log_time is None:
+                heartbeat_due = True
+            else:
+                elapsed = (now - self.last_log_time).to_sec()
+                heartbeat_due = (
+                    elapsed < 0.0 or elapsed >= self.LOG_HEARTBEAT_SECONDS
+                )
+            if state_changed or heartbeat_due:
                 if level == DiagnosticStatus.OK:
                     rospy.loginfo(compact)
                 elif level == DiagnosticStatus.WARN:
                     rospy.logwarn(compact)
                 else:
                     rospy.logerr(compact)
-                self.last_summary = compact
+                self.last_log_time = now
+            self.last_semantic_state = semantic_state
 
 
 def main():

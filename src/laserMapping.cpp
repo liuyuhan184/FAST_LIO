@@ -69,7 +69,10 @@
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
-double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
+// Timing history is needed only when runtime_pos_log is enabled.  Allocating it
+// lazily saves roughly 69 MiB in the normal onboard flight process.
+vector<double> T1, s_plot, s_plot2, s_plot3, s_plot4, s_plot5;
+vector<double> s_plot6, s_plot7, s_plot8, s_plot9, s_plot10, s_plot11;
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
@@ -80,6 +83,7 @@ float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
 double max_lidar_age_s = 0.0, max_odom_publish_age_s = 0.0;
+double main_loop_rate_hz = 1000.0;
 
 mutex mtx_buffer;
 condition_variable sig_buffer;
@@ -101,7 +105,7 @@ bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 int lidar_type;
 
-vector<vector<int>>  pointSearchInd_surf; 
+vector<vector<float>> Point_Distances;
 vector<BoxPointType> cub_needrm;
 vector<PointVector>  Nearest_Points; 
 vector<double>       extrinT(3, 0.0);
@@ -164,7 +168,6 @@ PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
@@ -273,9 +276,9 @@ void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 
 void points_cache_collect()
 {
-    PointVector points_history;
-    ikdtree.acquire_removed_points(points_history);
-    // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
+    // Removed map points are not used by the onboard pipeline.  Clear the
+    // ikd-tree bookkeeping in place instead of copying every point first.
+    ikdtree.clear_removed_points();
 }
 
 BoxPointType LocalMap_Points;
@@ -406,17 +409,22 @@ double timediff_lidar_wrt_imu = 0.0;
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
 {
     publish_count ++;
-    // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
-    sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
-
-    msg->header.stamp = ros::Time().fromSec(msg_in->header.stamp.toSec() - time_diff_lidar_to_imu);
+    const double input_timestamp = msg_in->header.stamp.toSec();
+    double timestamp = input_timestamp - time_diff_lidar_to_imu;
     if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
     {
-        msg->header.stamp = \
-        ros::Time().fromSec(timediff_lidar_wrt_imu + msg_in->header.stamp.toSec());
+        timestamp = timediff_lidar_wrt_imu + input_timestamp;
     }
 
-    double timestamp = msg->header.stamp.toSec();
+    // Airy normally needs no IMU timestamp adjustment.  Retain the incoming
+    // shared message in that case and avoid a 200 Hz deep copy.
+    sensor_msgs::Imu::ConstPtr msg = msg_in;
+    if (timestamp != input_timestamp)
+    {
+        sensor_msgs::Imu::Ptr adjusted_msg(new sensor_msgs::Imu(*msg_in));
+        adjusted_msg->header.stamp = ros::Time().fromSec(timestamp);
+        msg = adjusted_msg;
+    }
 
     mtx_buffer.lock();
 
@@ -565,7 +573,6 @@ void map_incremental()
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
 
-PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 {
@@ -690,7 +697,7 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
             lidar_buffer.size(), dropped_lidar_frames);
         return;
     }
-    ROS_INFO_THROTTLE(5.0,
+    ROS_INFO_THROTTLE(30.0,
         "FAST-LIO realtime status: odometry_age=%.3f s, queued_lidar=%zu, dropped_lidar=%zu",
         odom_age_s, lidar_buffer.size(), dropped_lidar_frames);
 
@@ -698,7 +705,7 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    auto P = kf.get_P();
+    const auto &P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -766,9 +773,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         point_world.z = p_global(2);
         point_world.intensity = point_body.intensity;
 
-        vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
-
         auto &points_near = Nearest_Points[i];
+        auto &pointSearchSqDis = Point_Distances[i];
 
         if (ekfom_data.converge)
         {
@@ -879,6 +885,7 @@ int main(int argc, char** argv)
     nh.param<int>("common/max_lidar_buffer_size", max_lidar_buffer_size, 2);
     nh.param<double>("common/max_lidar_age_s", max_lidar_age_s, 0.0);
     nh.param<double>("common/max_odom_publish_age_s", max_odom_publish_age_s, 0.0);
+    nh.param<double>("main_loop_rate_hz", main_loop_rate_hz, 1000.0);
     nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
     nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
     nh.param<double>("filter_size_map",filter_size_map_min,0.5);
@@ -905,20 +912,31 @@ int main(int argc, char** argv)
 
     if (lidar_sub_queue_size < 1 || imu_sub_queue_size < 1 ||
         max_lidar_buffer_size < 2 || max_lidar_age_s < 0.0 ||
-        max_odom_publish_age_s < 0.0)
+        max_odom_publish_age_s < 0.0 ||
+        main_loop_rate_hz < 500.0 || main_loop_rate_hz > 5000.0)
     {
         ROS_FATAL("Invalid realtime queue configuration: lidar_sub=%d imu_sub=%d "
-                  "lidar_buffer=%d max_lidar_age=%.3f max_odom_age=%.3f",
+                  "lidar_buffer=%d max_lidar_age=%.3f max_odom_age=%.3f loop_rate=%.1f",
                   lidar_sub_queue_size, imu_sub_queue_size,
                   max_lidar_buffer_size, max_lidar_age_s,
-                  max_odom_publish_age_s);
+                  max_odom_publish_age_s, main_loop_rate_hz);
         return 1;
     }
     ROS_INFO("FAST-LIO realtime queues: lidar_sub=%d imu_sub=%d lidar_buffer=%d "
-             "max_lidar_age=%.3f s max_odom_age=%.3f s",
+             "max_lidar_age=%.3f s max_odom_age=%.3f s loop_rate=%.1f Hz",
              lidar_sub_queue_size, imu_sub_queue_size,
              max_lidar_buffer_size, max_lidar_age_s,
-             max_odom_publish_age_s);
+             max_odom_publish_age_s, main_loop_rate_hz);
+
+    if (runtime_pos_log)
+    {
+        T1.resize(MAXN);       s_plot.resize(MAXN);
+        s_plot2.resize(MAXN);  s_plot3.resize(MAXN);
+        s_plot4.resize(MAXN);  s_plot5.resize(MAXN);
+        s_plot6.resize(MAXN);  s_plot7.resize(MAXN);
+        s_plot8.resize(MAXN);  s_plot9.resize(MAXN);
+        s_plot10.resize(MAXN); s_plot11.resize(MAXN);
+    }
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -933,8 +951,6 @@ int main(int argc, char** argv)
     
     FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
     HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
-
-    _featsArray.reset(new PointCloudXYZI());
 
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
@@ -956,18 +972,21 @@ int main(int argc, char** argv)
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
-    FILE *fp;
-    string pos_log_dir = root_dir + "/Log/pos_log.txt";
-    fp = fopen(pos_log_dir.c_str(),"w");
+    FILE *fp = nullptr;
 
     ofstream fout_pre, fout_out, fout_dbg;
-    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-    if (fout_pre && fout_out)
-        cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-    else
-        cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+    if (runtime_pos_log)
+    {
+        const string pos_log_dir = root_dir + "/Log/pos_log.txt";
+        fp = fopen(pos_log_dir.c_str(), "w");
+        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
+        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
+        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+        if (fp && fout_pre && fout_out && fout_dbg)
+            cout << "~~~~" << ROOT_DIR << " debug files opened" << endl;
+        else
+            ROS_WARN("FAST-LIO runtime logging is enabled, but one or more debug files could not be opened.");
+    }
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl;
@@ -1002,7 +1021,7 @@ int main(int argc, char** argv)
             ("/path", 1);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
+    ros::Rate rate(main_loop_rate_hz);
     bool status = ros::ok();
     while (status)
     {
@@ -1077,9 +1096,15 @@ int main(int argc, char** argv)
             normvec->resize(feats_down_size);
             feats_down_world->resize(feats_down_size);
 
-            V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-            fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
-            <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
+            if (runtime_pos_log && fout_pre)
+            {
+                const V3D ext_euler_pre = SO3ToEuler(state_point.offset_R_L_I);
+                fout_pre << setw(20) << Measures.lidar_beg_time - first_lidar_time << " "
+                         << euler_cur.transpose() << " " << state_point.pos.transpose() << " "
+                         << ext_euler_pre.transpose() << " " << state_point.offset_T_L_I.transpose() << " "
+                         << state_point.vel.transpose() << " " << state_point.bg.transpose() << " "
+                         << state_point.ba.transpose() << " " << state_point.grav << '\n';
+            }
 
             if(0) // If you need to see map point, change to "if(1)"
             {
@@ -1089,8 +1114,8 @@ int main(int argc, char** argv)
                 featsFromMap->points = ikdtree.PCL_Storage;
             }
 
-            pointSearchInd_surf.resize(feats_down_size);
             Nearest_Points.resize(feats_down_size);
+            Point_Distances.resize(feats_down_size);
             int  rematch_num = 0;
             bool nearest_search_en = true; //
 
@@ -1156,10 +1181,10 @@ int main(int argc, char** argv)
                     ROS_WARN_THROTTLE(5.0, "FAST-LIO timing buffer is full; stop recording mapping samples.");
                 }
                 printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
-                ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+                const V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
-                dump_lio_state_to_log(fp);
+                if (fp) dump_lio_state_to_log(fp);
             }
         }
 
@@ -1179,25 +1204,34 @@ int main(int argc, char** argv)
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
     }
 
-    fout_out.close();
-    fout_pre.close();
+    if (fp) fclose(fp);
+    if (fout_out.is_open()) fout_out.close();
+    if (fout_pre.is_open()) fout_pre.close();
+    if (fout_dbg.is_open()) fout_dbg.close();
 
     if (runtime_pos_log)
     {
         vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
-        FILE *fp2;
-        string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
-        fp2 = fopen(log_dir.c_str(),"w");
-        fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
-        for (int i = 0;i<time_log_counter; i++){
-            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
-            t.push_back(T1[i]);
-            s_vec.push_back(s_plot9[i]);
-            s_vec2.push_back(s_plot3[i] + s_plot6[i]);
-            s_vec3.push_back(s_plot4[i]);
-            s_vec5.push_back(s_plot[i]);
+        const string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
+        FILE *fp2 = fopen(log_dir.c_str(), "w");
+        if (!fp2)
+        {
+            ROS_WARN("Could not open FAST-LIO timing log: %s", log_dir.c_str());
         }
-        fclose(fp2);
+        else
+        {
+            fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
+            for (int i = 0; i < time_log_counter; i++)
+            {
+                fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
+                t.push_back(T1[i]);
+                s_vec.push_back(s_plot9[i]);
+                s_vec2.push_back(s_plot3[i] + s_plot6[i]);
+                s_vec3.push_back(s_plot4[i]);
+                s_vec5.push_back(s_plot[i]);
+            }
+            fclose(fp2);
+        }
     }
 
     return 0;

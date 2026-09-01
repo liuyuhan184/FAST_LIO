@@ -5,6 +5,9 @@
   <arg name="publish_clouds" default="false" />
   <arg name="dense_cloud" default="false" />
   <arg name="publish_body_cloud" default="false" />
+  <!-- 5 is the accuracy-first low-load default for the 96-line Airy.  Use 4
+       for maximum point retention in especially sparse environments. -->
+  <arg name="point_filter_num" default="5" />
 
   <include if="$(arg start_driver)" file="$(find rslidar_sdk)/launch/start_airy.launch">
     <arg name="rviz" value="false" />
@@ -15,11 +18,14 @@
   <param name="feature_extract_enable" type="bool" value="false" />
   <!-- Conservative Orin flight profile: retain mapping quality while keeping
        sustained processing above the Airy's nominal 10 Hz. -->
-  <param name="point_filter_num" type="int" value="4" />
+  <param name="point_filter_num" type="int" value="$(arg point_filter_num)" />
   <param name="max_iteration" type="int" value="3" />
   <param name="filter_size_surf" type="double" value="0.4" />
   <param name="filter_size_map" type="double" value="0.5" />
   <param name="cube_side_length" type="double" value="300" />
+  <!-- Airy is 10 Hz and its IMU is about 200 Hz.  1 kHz preserves sub-ms
+       callback polling without the original 5 kHz idle wake-up load. -->
+  <param name="main_loop_rate_hz" type="double" value="1000" />
   <param name="runtime_pos_log_enable" type="bool" value="false" />
   <param name="publish/scan_publish_en" type="bool" value="$(arg publish_clouds)" />
   <param name="publish/dense_publish_en" type="bool" value="$(arg dense_cloud)" />

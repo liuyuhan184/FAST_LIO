@@ -427,7 +427,6 @@ void KD_TREE<PointType>::Nearest_Search(PointType point, int k_nearest, PointVec
 {
     MANUAL_HEAP q(2 * k_nearest);
     q.clear();
-    vector<float>().swap(Point_Distance);
     if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
     {
         Search(Root_Node, k_nearest, point, q, max_dist);
@@ -449,12 +448,13 @@ void KD_TREE<PointType>::Nearest_Search(PointType point, int k_nearest, PointVec
         pthread_mutex_unlock(&search_flag_mutex);
     }
     int k_found = min(k_nearest, int(q.size()));
-    PointVector().swap(Nearest_Points);
-    vector<float>().swap(Point_Distance);
-    for (int i = 0; i < k_found; i++)
+    Nearest_Points.resize(k_found);
+    Point_Distance.resize(k_found);
+    for (int i = k_found - 1; i >= 0; --i)
     {
-        Nearest_Points.insert(Nearest_Points.begin(), q.top().point);
-        Point_Distance.insert(Point_Distance.begin(), q.top().dist);
+        const PointType_CMP candidate = q.top();
+        Nearest_Points[i] = candidate.point;
+        Point_Distance[i] = candidate.dist;
         q.pop();
     }
     return;
@@ -497,7 +497,7 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
             mid_point.x = Box_of_Point.vertex_min[0] + (Box_of_Point.vertex_max[0] - Box_of_Point.vertex_min[0]) / 2.0;
             mid_point.y = Box_of_Point.vertex_min[1] + (Box_of_Point.vertex_max[1] - Box_of_Point.vertex_min[1]) / 2.0;
             mid_point.z = Box_of_Point.vertex_min[2] + (Box_of_Point.vertex_max[2] - Box_of_Point.vertex_min[2]) / 2.0;
-            PointVector().swap(Downsample_Storage);
+            Downsample_Storage.clear();
             Search_by_range(Root_Node, Box_of_Point, Downsample_Storage);
             min_dist = calc_dist(PointToAdd[i], mid_point);
             downsample_result = PointToAdd[i];
@@ -673,6 +673,15 @@ void KD_TREE<PointType>::acquire_removed_points(PointVector &removed_points)
     Multithread_Points_deleted.clear();
     pthread_mutex_unlock(&points_deleted_rebuild_mutex_lock);
     return;
+}
+
+template <typename PointType>
+void KD_TREE<PointType>::clear_removed_points()
+{
+    pthread_mutex_lock(&points_deleted_rebuild_mutex_lock);
+    Points_deleted.clear();
+    Multithread_Points_deleted.clear();
+    pthread_mutex_unlock(&points_deleted_rebuild_mutex_lock);
 }
 
 template <typename PointType>
@@ -1725,4 +1734,3 @@ bool KD_TREE<PointType>::point_cmp_z(PointType a, PointType b) { return a.z < b.
 template class KD_TREE<pcl::PointXYZ>;
 template class KD_TREE<pcl::PointXYZI>;
 template class KD_TREE<pcl::PointXYZINormal>;
-
